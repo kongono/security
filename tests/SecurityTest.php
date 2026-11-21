@@ -11,8 +11,10 @@ use Kongono\Http\Request;
 use Kongono\Http\Response;
 use Kongono\Http\Routing\Get;
 use Kongono\Http\Routing\Middleware;
+use Kongono\Http\Routing\Post;
 use Kongono\Http\Routing\Router;
 use Kongono\Security\Attributes\Can;
+use Kongono\Security\Attributes\VerifyWebhook;
 use Kongono\Security\Egress\SafeHttpClient;
 use Kongono\Security\Encryptor;
 use Kongono\Security\Gate;
@@ -27,6 +29,7 @@ use Kongono\Security\PrincipalKind;
 use Kongono\Security\SecurityException;
 use Kongono\Security\SignedUrl;
 use Kongono\Security\TokenSigner;
+use Kongono\Security\Webhook\WebhookSigner;
 use PHPUnit\Framework\TestCase;
 
 final class SecurityTest extends TestCase
@@ -240,6 +243,31 @@ final class SecurityTest extends TestCase
         self::assertSame(403, $app->handle(Request::create('GET', '/reports/secret', ['Authorization' => 'Bearer reader-tok']))->getStatusCode());
         self::assertSame(200, $app->handle(Request::create('GET', '/reports/secret', ['Authorization' => 'Bearer admin-tok']))->getStatusCode());
     }
+
+    public function testWebhookSignerAndVerifyWebhookAttribute(): void
+    {
+        $signer = new WebhookSigner('webhook-signing-secret-1234567890');
+        $body = '{"event":"invoice.paid","amount":4200}';
+        $sig = $signer->sign($body, timestamp: 1000);
+
+        self::assertTrue($signer->verify($body, $sig, toleranceSeconds: 300, now: 1200));
+        self::assertFalse($signer->verify($body, $sig, toleranceSeconds: 300, now: 1500));
+        self::assertFalse($signer->verify($body . 'x', $sig, toleranceSeconds: 300, now: 1200));
+
+        $app = App::create(__DIR__)
+            ->instance(WebhookSigner::class, $signer)
+            ->controller(GuardedReportsController::class);
+
+        // Missing or invalid signature fails closed 401
+        self::assertSame(401, $app->handle(Request::create('POST', '/webhooks/billing', body: $body))->getStatusCode());
+        self::assertSame(401, $app->handle(Request::create('POST', '/webhooks/billing', [WebhookSigner::DEFAULT_HEADER => 't=1,v1=bad'], body: $body))->getStatusCode());
+
+        // Valid fresh signature succeeds 200
+        $freshSig = $signer->sign($body);
+        $ok = $app->handle(Request::create('POST', '/webhooks/billing', [WebhookSigner::DEFAULT_HEADER => $freshSig], body: $body));
+        self::assertSame(200, $ok->getStatusCode());
+        self::assertSame('{"received":true}', (string) $ok->getBody());
+    }
 }
 
 final readonly class GuardedReportsController
@@ -250,5 +278,12 @@ final readonly class GuardedReportsController
     public function secret(Principal $principal): Response
     {
         return Response::json(['ok' => true, 'actor' => $principal->id]);
+    }
+
+    #[Post('/webhooks/billing', name: 'webhooks.billing')]
+    #[VerifyWebhook]
+    public function billingWebhook(): Response
+    {
+        return Response::json(['received' => true]);
     }
 }
