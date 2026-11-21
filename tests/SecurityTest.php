@@ -11,6 +11,7 @@ use Kongono\Http\Request;
 use Kongono\Http\Response;
 use Kongono\Http\Routing\Router;
 use Kongono\Security\Egress\SafeHttpClient;
+use Kongono\Security\Encryptor;
 use Kongono\Security\Gate;
 use Kongono\Security\Middleware\BearerAuthMiddleware;
 use Kongono\Security\Middleware\CorsMiddleware;
@@ -21,6 +22,7 @@ use Kongono\Security\PasswordHasher;
 use Kongono\Security\Principal;
 use Kongono\Security\PrincipalKind;
 use Kongono\Security\SecurityException;
+use Kongono\Security\SignedUrl;
 use Kongono\Security\TokenSigner;
 use PHPUnit\Framework\TestCase;
 
@@ -176,5 +178,46 @@ final class SecurityTest extends TestCase
         $r3 = $app->handle(Request::create('GET', '/api/ping'));
         self::assertSame(429, $r3->getStatusCode());
         self::assertSame('60', $r3->getHeaderLine('Retry-After'));
+    }
+
+    public function testEncryptorAeadAndKeyRotation(): void
+    {
+        $oldKey = Encryptor::generateKey();
+        $newKey = Encryptor::generateKey();
+
+        $oldEnc = new Encryptor($oldKey);
+        $cipher = $oldEnc->encrypt('top-secret-payload', associatedData: 'tenant:42');
+        self::assertStringStartsWith('v1.', $cipher);
+        self::assertSame('top-secret-payload', $oldEnc->decrypt($cipher, associatedData: 'tenant:42'));
+
+        // Key rotation decrypts old payloads transparently with previousKeys
+        $rotated = new Encryptor($newKey, previousKeys: [$oldKey]);
+        self::assertSame('top-secret-payload', $rotated->decrypt($cipher, associatedData: 'tenant:42'));
+
+        // Wrong associated data fails closed
+        try {
+            $rotated->decrypt($cipher, associatedData: 'tenant:99');
+            self::fail('Expected AAD mismatch to throw SecurityException.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('Decryption failed', $e->getMessage());
+        }
+
+        // Tampered ciphertext fails closed
+        $this->expectException(SecurityException::class);
+        $rotated->decrypt($cipher . 'A', associatedData: 'tenant:42');
+    }
+
+    public function testSignedUrlSignsVerifiesAndExpires(): void
+    {
+        $signer = new SignedUrl('signed-url-secret-key-at-least-16-bytes');
+
+        $permanent = $signer->sign('/downloads/report.pdf', ['user' => 7]);
+        self::assertTrue($signer->verify($permanent));
+        self::assertFalse($signer->verify($permanent . '&evil=1'));
+        self::assertFalse($signer->verify(str_replace('user=7', 'user=8', $permanent)));
+
+        $temp = $signer->temporary('/verify-email', ttlSeconds: 300, query: ['id' => 42], now: 1000);
+        self::assertTrue($signer->verify($temp, now: 1200));
+        self::assertFalse($signer->verify($temp, now: 1300));
     }
 }
