@@ -1,0 +1,18 @@
+{
+  "name": "kongono/security",
+  "description": "Kongono v1 Principals (Human/Service/Agent), capability Gate, Argon2id hashing, HMAC TokenSigner, CSRF/CORS/Bearer/SecurityHeaders middleware, and SSRF-hardened SafeHttpClient.",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.5.0",
+    "ext-curl": "*",
+    "psr/http-message": "^2.0",
+    "psr/http-server-handler": "^1.0",
+    "psr/http-server-middleware": "^1.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Kongono\\Security\\": "src/"
+    }
+  }
+}
