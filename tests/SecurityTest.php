@@ -9,7 +9,10 @@ use Kongono\Http\App;
 use Kongono\Http\HttpException;
 use Kongono\Http\Request;
 use Kongono\Http\Response;
+use Kongono\Http\Routing\Get;
+use Kongono\Http\Routing\Middleware;
 use Kongono\Http\Routing\Router;
+use Kongono\Security\Attributes\Can;
 use Kongono\Security\Egress\SafeHttpClient;
 use Kongono\Security\Encryptor;
 use Kongono\Security\Gate;
@@ -219,5 +222,33 @@ final class SecurityTest extends TestCase
         $temp = $signer->temporary('/verify-email', ttlSeconds: 300, query: ['id' => 42], now: 1000);
         self::assertTrue($signer->verify($temp, now: 1200));
         self::assertFalse($signer->verify($temp, now: 1300));
+    }
+
+    public function testCanAttributeEnforcesCapabilitiesOnControllers(): void
+    {
+        $bearer = new BearerAuthMiddleware(static fn(string $token): ?Principal => match ($token) {
+            'reader-tok' => new Principal('u-1', PrincipalKind::Human, ['reports.read']),
+            'admin-tok' => new Principal('u-2', PrincipalKind::Human, ['reports.read', 'reports.delete']),
+            default => null,
+        });
+
+        $app = App::create(__DIR__)
+            ->instance(BearerAuthMiddleware::class, $bearer)
+            ->controller(GuardedReportsController::class);
+
+        self::assertSame(401, $app->handle(Request::create('GET', '/reports/secret'))->getStatusCode());
+        self::assertSame(403, $app->handle(Request::create('GET', '/reports/secret', ['Authorization' => 'Bearer reader-tok']))->getStatusCode());
+        self::assertSame(200, $app->handle(Request::create('GET', '/reports/secret', ['Authorization' => 'Bearer admin-tok']))->getStatusCode());
+    }
+}
+
+final readonly class GuardedReportsController
+{
+    #[Get('/reports/secret', name: 'reports.secret')]
+    #[Middleware(BearerAuthMiddleware::class)]
+    #[Can('reports.delete')]
+    public function secret(Principal $principal): Response
+    {
+        return Response::json(['ok' => true, 'actor' => $principal->id]);
     }
 }
