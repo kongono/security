@@ -29,6 +29,7 @@ use Kongono\Security\PrincipalKind;
 use Kongono\Security\SecurityException;
 use Kongono\Security\SignedUrl;
 use Kongono\Security\TokenSigner;
+use Kongono\Security\Totp;
 use Kongono\Security\Webhook\WebhookSigner;
 use PHPUnit\Framework\TestCase;
 
@@ -267,6 +268,31 @@ final class SecurityTest extends TestCase
         $ok = $app->handle(Request::create('POST', '/webhooks/billing', [WebhookSigner::DEFAULT_HEADER => $freshSig], body: $body));
         self::assertSame(200, $ok->getStatusCode());
         self::assertSame('{"received":true}', (string) $ok->getBody());
+    }
+
+    public function testTotpRfc6238VerificationProvisioningUriAndRecoveryCodes(): void
+    {
+        // RFC 6238 Appendix B SHA-1 test vector: ASCII "12345678901234567890" -> Base32 GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ
+        $rfcSecret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+        $totp8 = new Totp(digits: 8, period: 30);
+        self::assertSame('94287082', $totp8->code($rfcSecret, timestamp: 59));
+
+        $totp6 = new Totp(digits: 6, period: 30);
+        $secret = Totp::generateSecret();
+        $code = $totp6->code($secret, timestamp: 1_700_000_000);
+        self::assertSame(6, strlen($code));
+        self::assertTrue($totp6->verify($secret, $code, window: 1, timestamp: 1_700_000_000));
+        self::assertTrue($totp6->verify($secret, $code, window: 1, timestamp: 1_700_000_030)); // +/- 1 step drift
+        self::assertFalse($totp6->verify($secret, $code, window: 1, timestamp: 1_700_000_120)); // too old
+        self::assertFalse($totp6->verify($secret, '000000', window: 0, timestamp: 1_700_000_000));
+
+        $uri = $totp6->provisioningUri($secret, 'ada@kongono.dev', 'Kongono');
+        self::assertStringStartsWith('otpauth://totp/Kongono:ada%40kongono.dev?', $uri);
+        self::assertStringContainsString('secret=' . $secret, $uri);
+
+        $recovery = Totp::generateRecoveryCodes(4);
+        self::assertCount(4, $recovery);
+        self::assertMatchesRegularExpression('/\A[0-9A-F]{4}-[0-9A-F]{4}\z/', $recovery[0]);
     }
 }
 
