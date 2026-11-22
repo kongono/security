@@ -199,7 +199,8 @@ final class SecurityTest extends TestCase
 
         $oldEnc = new Encryptor($oldKey);
         $cipher = $oldEnc->encrypt('top-secret-payload', associatedData: 'tenant:42');
-        self::assertStringStartsWith('v1.', $cipher);
+        self::assertStringStartsWith('v2.', $cipher);
+        self::assertFalse(Encryptor::needsReencrypt($cipher));
         self::assertSame('top-secret-payload', $oldEnc->decrypt($cipher, associatedData: 'tenant:42'));
 
         // Key rotation decrypts old payloads transparently with previousKeys
@@ -880,12 +881,39 @@ final class SecurityTest extends TestCase
             self::addToAssertionCount(1);
         }
 
-        // 11. Encryptor rejects non-canonical padded base64url payloads
-        $enc = new Encryptor('encryptor-r4-secret-key-at-least-32b!');
-        $ct = $enc->encrypt('secret');
+        // 11. Encryptor emits HKDF v2., rejects non-canonical padded base64url, and supports zero-downtime v1. migration
+        $rawEncKey = 'encryptor-r4-secret-key-at-least-32b!';
+        $enc = new Encryptor($rawEncKey);
+        $ct = $enc->encrypt('secret', 'ctx:1');
+        self::assertStringStartsWith('v2.', $ct);
+        self::assertFalse(Encryptor::needsReencrypt($ct));
         try {
-            $enc->decrypt($ct . '=');
+            $enc->decrypt($ct . '=', 'ctx:1');
             self::fail('Expected non-canonical padded ciphertext to fail.');
+        } catch (SecurityException) {
+            self::addToAssertionCount(1);
+        }
+
+        // Cross-version downgrade (renaming v2. -> v1.) MUST fail closed
+        try {
+            $enc->decrypt('v1.' . substr($ct, 3), 'ctx:1');
+            self::fail('Expected v2->v1 prefix downgrade to fail.');
+        } catch (SecurityException) {
+            self::addToAssertionCount(1);
+        }
+
+        // Legacy Kongono v1.5 ciphertext (SHA-256 derived key, raw AAD) decrypts cleanly when acceptLegacyV1=true
+        $legacyNonce = random_bytes(SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
+        $legacyCipher = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt('legacy-secret', 'ctx:1', $legacyNonce, hash('sha256', $rawEncKey, true));
+        $legacyPayload = 'v1.' . rtrim(strtr(base64_encode($legacyNonce . $legacyCipher), '+/', '-_'), '=');
+        self::assertTrue(Encryptor::needsReencrypt($legacyPayload));
+        self::assertSame('legacy-secret', $enc->decrypt($legacyPayload, 'ctx:1'));
+
+        // Strict v2-only mode rejects legacy v1. ciphertexts fail-closed
+        $strictEnc = new Encryptor($rawEncKey, acceptLegacyV1: false);
+        try {
+            $strictEnc->decrypt($legacyPayload, 'ctx:1');
+            self::fail('Expected strict v2-only Encryptor to reject legacy v1 payload.');
         } catch (SecurityException) {
             self::addToAssertionCount(1);
         }
