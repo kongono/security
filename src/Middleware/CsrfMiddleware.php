@@ -6,6 +6,7 @@ namespace Kongono\Security\Middleware;
 
 use Kongono\Http\HttpException;
 use Kongono\Http\Request;
+use Kongono\Http\Session\Session;
 use Kongono\Security\TokenSigner;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
@@ -48,10 +49,18 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
             }
         }
 
-        $cookies = $request->getCookieParams();
-        $sessionId = is_string($cookies[$this->sessionCookieName] ?? null) ? $cookies[$this->sessionCookieName] : '';
-        if ('' === $sessionId) {
-            throw new HttpException(403, 'CSRF verification failed: missing session context.');
+        $session = $request->getAttribute(Session::class);
+        if ($session instanceof Session) {
+            if (!$session->isPersisted()) {
+                throw new HttpException(403, 'CSRF verification failed: session is missing, expired, or revoked.');
+            }
+            $sessionId = $session->id();
+        } else {
+            $cookies = $request->getCookieParams();
+            $sessionId = is_string($cookies[$this->sessionCookieName] ?? null) ? $cookies[$this->sessionCookieName] : '';
+            if ('' === $sessionId) {
+                throw new HttpException(403, 'CSRF verification failed: missing session context.');
+            }
         }
 
         $token = trim($request->getHeaderLine($this->headerName));

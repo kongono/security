@@ -12,6 +12,9 @@ final readonly class TokenSigner
 {
     public const int MAX_TOKEN_BYTES = 16_384;
 
+    private const string DOMAIN_TOKEN = 'token';
+    private const string DOMAIN_CSRF = 'csrf';
+
     public function __construct(
         #[SensitiveParameter]
         private string $secretKey,
@@ -28,6 +31,58 @@ final readonly class TokenSigner
      */
     public function sign(array $claims, int $ttlSeconds = 3600, ?int $now = null): string
     {
+        return $this->signInDomain(self::DOMAIN_TOKEN, $claims, $ttlSeconds, $now);
+    }
+
+    /**
+     * Verify a signed token and return its claims, or null if invalid or expired.
+     * Domain-separated from CSRF tokens so HTML-exposed CSRF tokens are never accepted here.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function verify(#[SensitiveParameter] string $token, ?int $now = null, ?string $expectedPurpose = null): ?array
+    {
+        $claims = $this->verifyInDomain(self::DOMAIN_TOKEN, $token, $now);
+        if (null === $claims) {
+            return null;
+        }
+        if (null !== $expectedPurpose && ($claims['purpose'] ?? null) !== $expectedPurpose) {
+            return null;
+        }
+
+        return $claims;
+    }
+
+    public function generateCsrfToken(string $sessionContext, int $ttlSeconds = 7200, ?int $now = null): string
+    {
+        if ('' === trim($sessionContext)) {
+            throw new SecurityException('CSRF token generation requires a non-empty session context.');
+        }
+
+        return $this->signInDomain(self::DOMAIN_CSRF, [
+            'purpose' => 'csrf',
+            'ctx' => hash('sha256', $sessionContext),
+            'nonce' => bin2hex(random_bytes(16)),
+        ], $ttlSeconds, $now);
+    }
+
+    public function verifyCsrfToken(#[SensitiveParameter] string $token, string $sessionContext, ?int $now = null): bool
+    {
+        if ('' === trim($sessionContext)) {
+            return false;
+        }
+
+        $claims = $this->verifyInDomain(self::DOMAIN_CSRF, $token, $now);
+        if (null === $claims || 'csrf' !== ($claims['purpose'] ?? null) || !is_string($claims['ctx'] ?? null)) {
+            return false;
+        }
+
+        return hash_equals(hash('sha256', $sessionContext), $claims['ctx']);
+    }
+
+    /** @param array<string, mixed> $claims */
+    private function signInDomain(string $domain, array $claims, int $ttlSeconds, ?int $now): string
+    {
         $issuedAt = $now ?? time();
         $envelope = [
             'iat' => $issuedAt,
@@ -35,17 +90,13 @@ final readonly class TokenSigner
             'claims' => $claims,
         ];
         $encoded = $this->base64UrlEncode(json_encode($envelope, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
-        $sig = $this->base64UrlEncode(hash_hmac('sha256', $encoded, $this->secretKey, true));
+        $sig = $this->base64UrlEncode(hash_hmac('sha256', $domain . ':' . $encoded, $this->secretKey, true));
 
         return $encoded . '.' . $sig;
     }
 
-    /**
-     * Verify a signed token and return its claims, or null if invalid or expired.
-     *
-     * @return array<string, mixed>|null
-     */
-    public function verify(#[SensitiveParameter] string $token, ?int $now = null): ?array
+    /** @return array<string, mixed>|null */
+    private function verifyInDomain(string $domain, #[SensitiveParameter] string $token, ?int $now): ?array
     {
         if ('' === $token || strlen($token) > self::MAX_TOKEN_BYTES) {
             return null;
@@ -55,7 +106,7 @@ final readonly class TokenSigner
             return null;
         }
         [$encoded, $signature] = $parts;
-        $expected = $this->base64UrlEncode(hash_hmac('sha256', $encoded, $this->secretKey, true));
+        $expected = $this->base64UrlEncode(hash_hmac('sha256', $domain . ':' . $encoded, $this->secretKey, true));
         if (!hash_equals($expected, $signature)) {
             return null;
         }
@@ -87,25 +138,6 @@ final readonly class TokenSigner
         }
 
         return $claims;
-    }
-
-    public function generateCsrfToken(string $sessionContext, int $ttlSeconds = 7200, ?int $now = null): string
-    {
-        return $this->sign([
-            'purpose' => 'csrf',
-            'ctx' => hash('sha256', $sessionContext),
-            'nonce' => bin2hex(random_bytes(16)),
-        ], $ttlSeconds, $now);
-    }
-
-    public function verifyCsrfToken(#[SensitiveParameter] string $token, string $sessionContext, ?int $now = null): bool
-    {
-        $claims = $this->verify($token, $now);
-        if (null === $claims || 'csrf' !== ($claims['purpose'] ?? null) || !is_string($claims['ctx'] ?? null)) {
-            return false;
-        }
-
-        return hash_equals(hash('sha256', $sessionContext), $claims['ctx']);
     }
 
     private function base64UrlEncode(string $bytes): string

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Kongono\Security;
 
+use Kongono\Core\Cache\AtomicCacheInterface;
+use Kongono\Core\Cache\CacheInterface;
 use SensitiveParameter;
 
 /**
@@ -32,7 +34,7 @@ final readonly class Totp
     }
 
     /**
-     * Generate human-friendly single-use backup recovery codes (`XXXX-XXXX`).
+     * Generate human-friendly single-use 80-bit backup recovery codes (`XXXX-XXXX-XXXX-XXXX-XXXX`).
      *
      * @param positive-int $count
      * @return list<string>
@@ -41,8 +43,8 @@ final readonly class Totp
     {
         $codes = [];
         for ($i = 0; $i < $count; ++$i) {
-            $hex = strtoupper(bin2hex(random_bytes(4)));
-            $codes[] = substr($hex, 0, 4) . '-' . substr($hex, 4, 4);
+            $hex = strtoupper(bin2hex(random_bytes(10)));
+            $codes[] = implode('-', str_split($hex, 4));
         }
 
         return $codes;
@@ -56,31 +58,77 @@ final readonly class Totp
         return $this->hotp($base32Secret, $counter);
     }
 
-    /** Verify a user-supplied TOTP code in constant time across +/- $window time steps. */
+    /**
+     * Verify a user-supplied TOTP code in constant time across +/- $window time steps.
+     * Supports RFC 6238 Section 5.2 single-use anti-replay via `$lastVerifiedStep` and/or `$replayCache`.
+     */
     public function verify(
         #[SensitiveParameter]
         string $base32Secret,
         string $userCode,
         int $window = 1,
         ?int $timestamp = null,
+        ?int $lastVerifiedStep = null,
+        ?CacheInterface $replayCache = null,
     ): bool {
+        $step = $this->verifyAndReturnTimeStep($base32Secret, $userCode, $window, $timestamp, $lastVerifiedStep, $replayCache);
+
+        return null !== $step;
+    }
+
+    /**
+     * Verify a TOTP code and return the matched time-step counter (or null on failure/replay)
+     * so callers can persist `lastVerifiedStep` and reject duplicate use per RFC 6238 Section 5.2.
+     */
+    public function verifyAndReturnTimeStep(
+        #[SensitiveParameter]
+        string $base32Secret,
+        string $userCode,
+        int $window = 1,
+        ?int $timestamp = null,
+        ?int $lastVerifiedStep = null,
+        ?CacheInterface $replayCache = null,
+    ): ?int {
         $normalized = preg_replace('/[\s-]+/', '', trim($userCode));
         if (!is_string($normalized) || strlen($normalized) !== $this->digits || !ctype_digit($normalized)) {
-            return false;
+            return null;
         }
 
         $counter = intdiv($timestamp ?? time(), $this->period);
         $drift = max(0, $window);
-        $matched = false;
+        $matchedStep = null;
 
         for ($offset = -$drift; $offset <= $drift; ++$offset) {
-            $expected = $this->hotp($base32Secret, $counter + $offset);
+            $step = $counter + $offset;
+            $expected = $this->hotp($base32Secret, $step);
             if (hash_equals($expected, $normalized)) {
-                $matched = true;
+                $matchedStep = $step;
             }
         }
 
-        return $matched;
+        if (null === $matchedStep) {
+            return null;
+        }
+        if (null !== $lastVerifiedStep && $matchedStep <= $lastVerifiedStep) {
+            return null;
+        }
+
+        if (null !== $replayCache) {
+            $replayKey = 'kongono:totp:used:' . hash('sha256', $base32Secret . ':' . $matchedStep);
+            $ttl = (2 * $drift + 2) * $this->period;
+            if ($replayCache instanceof AtomicCacheInterface) {
+                if (!$replayCache->add($replayKey, true, $ttl)) {
+                    return null;
+                }
+            } else {
+                if ($replayCache->has($replayKey)) {
+                    return null;
+                }
+                $replayCache->set($replayKey, true, $ttl);
+            }
+        }
+
+        return $matchedStep;
     }
 
     /** Build an `otpauth://totp/...` provisioning URI for authenticator QR code scanning. */

@@ -27,6 +27,7 @@ use Kongono\Security\Middleware\CorsMiddleware;
 use Kongono\Security\Middleware\CsrfMiddleware;
 use Kongono\Security\Middleware\RateLimitMiddleware;
 use Kongono\Security\Middleware\SecurityHeadersMiddleware;
+use Kongono\Security\Middleware\VerifyWebhookMiddleware;
 use Kongono\Security\PasswordHasher;
 use Kongono\Security\Principal;
 use Kongono\Security\PrincipalKind;
@@ -296,7 +297,7 @@ final class SecurityTest extends TestCase
 
         $recovery = Totp::generateRecoveryCodes(4);
         self::assertCount(4, $recovery);
-        self::assertMatchesRegularExpression('/\A[0-9A-F]{4}-[0-9A-F]{4}\z/', $recovery[0]);
+        self::assertMatchesRegularExpression('/\A[0-9A-F]{4}(?:-[0-9A-F]{4}){4}\z/', $recovery[0]);
     }
 
     public function testAiThreatShieldBlocksHoneypotsReconBurstsAndComputeBudgets(): void
@@ -597,6 +598,153 @@ final class SecurityTest extends TestCase
             algorithm: 'EdDSA',
             now: 3010,
         );
+    }
+
+    public function testRound3SsrfSignedUrlRateLimitThreatShieldPasskeyTotpTokenAndWebhookHardening(): void
+    {
+        // 1. SafeHttpClient blocks percent-encoded hosts, invalid HTTP methods, and IPv6/IPv4 special-use ranges
+        $client = new SafeHttpClient(
+            dnsResolver: static fn(): array => ['93.184.216.34'],
+        );
+        foreach (['https://%72ebind.example.com/', 'https://evil\\@example.com/'] as $badUrl) {
+            try {
+                $client->request('GET', $badUrl);
+                self::fail('Expected SafeHttpClient to reject: ' . $badUrl);
+            } catch (SecurityException) {
+                self::addToAssertionCount(1);
+            }
+        }
+        try {
+            $client->request("GET / HTTP/1.1\r\nHost: evil", 'https://example.com/');
+            self::fail('Expected invalid HTTP method to be rejected.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('Invalid outbound HTTP method', $e->getMessage());
+        }
+        foreach (['2002:a9fe:a9fe::1', '2001:0000:4136:e378::1', '100::1', 'fec0::1', '198.18.0.1', '192.0.2.1'] as $blockedIp) {
+            $ipClient = new SafeHttpClient(dnsResolver: static fn(): array => [$blockedIp]);
+            try {
+                $ipClient->request('GET', 'https://target.example.com/');
+                self::fail('Expected special-use IP to be blocked: ' . $blockedIp);
+            } catch (SecurityException $e) {
+                self::assertStringContainsString('SSRF blocked', $e->getMessage());
+            }
+        }
+
+        // 2. SignedUrl: rejects HPP duplicate params, fragments, origin mismatches, and >100 params; preserves full URL origin
+        $signedUrl = new SignedUrl('signed-url-round3-key-at-least-32-bytes!');
+        $fullSigned = $signedUrl->temporary('https://app.kongono.dev/download', 300, ['file' => 'a.pdf'], now: 5000);
+        self::assertTrue($signedUrl->verify($fullSigned, now: 5010));
+        self::assertFalse($signedUrl->verify(str_replace('https://app.kongono.dev', 'https://evil.test', $fullSigned), now: 5010));
+        self::assertFalse($signedUrl->verify($fullSigned . '&file=evil.pdf', now: 5010));
+        self::assertFalse($signedUrl->verify($fullSigned . '#frag', now: 5010));
+        $manyParams = '/p?' . implode('&', array_map(static fn(int $i): string => "k{$i}=1", range(1, 105)));
+        self::assertFalse($signedUrl->verify($manyParams, now: 5010));
+
+        // 3. RateLimitMiddleware canonicalizes /login, /login/, //login into ONE shared bucket
+        $rlCache = new MemoryCache();
+        $rlApp = App::create(__DIR__)
+            ->middleware(new RateLimitMiddleware($rlCache, maxRequests: 2, windowSeconds: 60))
+            ->routes(static function (Router $r): void {
+                $r->post('/login', static fn(): Response => Response::text('ok'));
+            });
+        self::assertSame(200, $rlApp->handle(Request::create('POST', '/login', serverParams: ['REMOTE_ADDR' => '198.51.100.9']))->getStatusCode());
+        self::assertSame(200, $rlApp->handle(Request::create('POST', '/login/', serverParams: ['REMOTE_ADDR' => '198.51.100.9']))->getStatusCode());
+        self::assertSame(429, $rlApp->handle(Request::create('POST', '//login///', serverParams: ['REMOTE_ADDR' => '198.51.100.9']))->getStatusCode());
+
+        // 4. AiThreatShieldMiddleware catches dot-segment & matrix-param evasions AND global-middleware 401 recon bursts
+        foreach (['/../.env', '/foo/../.env', '/%2e%2e/.env', '/.env;foo=bar', '/.../.env'] as $idx => $evasion) {
+            $shield = new AiThreatShieldMiddleware(new MemoryCache());
+            $app = App::create(__DIR__)->middleware($shield);
+            $ip = '198.51.100.' . (20 + $idx);
+            $res = $app->handle(Request::create('GET', $evasion, serverParams: ['REMOTE_ADDR' => $ip]));
+            self::assertSame(403, $res->getStatusCode(), 'Expected evasion catch for ' . $evasion);
+            self::assertTrue($shield->isBanned($ip));
+        }
+
+        $burstShield = new AiThreatShieldMiddleware(new MemoryCache(), maxProbesPerWindow: 2);
+        $burstApp = App::create(__DIR__)
+            ->middleware($burstShield)
+            ->routes(static function (Router $r): void {
+                $r->get('/secret', static function (): Response {
+                    throw new HttpException(401, 'Unauthorized');
+                });
+            });
+        $attackerIp = '198.51.100.99';
+        self::assertSame(401, $burstApp->handle(Request::create('GET', '/secret', serverParams: ['REMOTE_ADDR' => $attackerIp]))->getStatusCode());
+        self::assertSame(401, $burstApp->handle(Request::create('GET', '/secret', serverParams: ['REMOTE_ADDR' => $attackerIp]))->getStatusCode());
+        self::assertTrue($burstShield->isBanned($attackerIp));
+        self::assertSame(403, $burstApp->handle(Request::create('GET', '/secret', serverParams: ['REMOTE_ADDR' => $attackerIp]))->getStatusCode());
+
+        // 5. PasskeyVerifier: W3C signCount=0 clone detection when previousSignCount > 0 + atomic single-use challenge
+        $pkCache = new MemoryCache();
+        $passkeys = new PasskeyVerifier($pkCache);
+        $ch = $passkeys->createChallenge('kongono.dev', 'https://kongono.dev', now: 4000);
+        $kp = sodium_crypto_sign_keypair();
+        $cd = json_encode(['type' => 'webauthn.get', 'challenge' => $ch['challenge'], 'origin' => 'https://kongono.dev', 'crossOrigin' => false], JSON_THROW_ON_ERROR);
+        $adZero = hash('sha256', 'kongono.dev', true) . chr(0x01) . pack('N', 0);
+        $sigZero = sodium_crypto_sign_detached($adZero . hash('sha256', $cd, true), sodium_crypto_sign_secretkey($kp));
+        try {
+            $passkeys->verifyAssertion(
+                expectedChallenge: $ch['challenge'],
+                clientDataJsonBase64Url: PasskeyVerifier::base64UrlEncode($cd),
+                authenticatorDataBase64Url: PasskeyVerifier::base64UrlEncode($adZero),
+                signatureBase64Url: PasskeyVerifier::base64UrlEncode($sigZero),
+                publicKey: bin2hex(sodium_crypto_sign_publickey($kp)),
+                algorithm: 'EdDSA',
+                previousSignCount: 5,
+                now: 4010,
+            );
+            self::fail('Expected signCount=0 rollback to be flagged as cloned authenticator.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('cloned authenticator', strtolower($e->getMessage()));
+        }
+
+        // 6. Totp: 80-bit recovery codes + single-use replay rejection
+        $codes = Totp::generateRecoveryCodes(4);
+        self::assertCount(4, $codes);
+        self::assertMatchesRegularExpression('/\A[0-9A-F]{4}(?:-[0-9A-F]{4}){4}\z/', $codes[0]);
+        $totp = new Totp();
+        $totpSecret = Totp::generateSecret();
+        $code = $totp->code($totpSecret, timestamp: 1_700_000_000);
+        $replayCache = new MemoryCache();
+        $step = $totp->verifyAndReturnTimeStep($totpSecret, $code, timestamp: 1_700_000_000, replayCache: $replayCache);
+        self::assertNotNull($step);
+        self::assertNull($totp->verifyAndReturnTimeStep($totpSecret, $code, timestamp: 1_700_000_000, replayCache: $replayCache));
+        self::assertNull($totp->verifyAndReturnTimeStep($totpSecret, $code, timestamp: 1_700_000_000, lastVerifiedStep: $step));
+
+        // 7. TokenSigner: domain separation prevents CSRF token from verifying as general bearer token
+        $signer = new TokenSigner('domain-sep-key-at-least-32-bytes-long!!');
+        $csrfTok = $signer->generateCsrfToken('sess-123');
+        self::assertNull($signer->verify($csrfTok));
+        self::assertTrue($signer->verifyCsrfToken($csrfTok, 'sess-123'));
+
+        // 8. WebhookSigner duplicate t= rejection & VerifyWebhookMiddleware atomic replay protection (409)
+        $whSigner = new WebhookSigner('webhook-secret-key-at-least-32-bytes!!');
+        $payload = '{"event":"invoice.paid"}';
+        $now = time();
+        $goodSig = $whSigner->sign($payload, $now);
+        self::assertNull($whSigner->verifyAndFingerprint($payload, "t={$now},t={$now}," . substr($goodSig, strpos($goodSig, 'v1=') ?: 0)));
+
+        $whApp = App::create(__DIR__)
+            ->middleware(new VerifyWebhookMiddleware($whSigner, replayCache: new MemoryCache()))
+            ->routes(static function (Router $r): void {
+                $r->post('/hook', static fn(): Response => Response::text('ok'));
+            });
+        self::assertSame(200, $whApp->handle(Request::create('POST', '/hook', ['X-Kongono-Signature' => $goodSig], $payload))->getStatusCode());
+        self::assertSame(409, $whApp->handle(Request::create('POST', '/hook', ['X-Kongono-Signature' => $goodSig], $payload))->getStatusCode());
+
+        // 9. SecurityHeadersMiddleware attaches security headers even on thrown HttpException responses
+        $hdrApp = App::create(__DIR__)
+            ->middleware(new SecurityHeadersMiddleware())
+            ->routes(static function (Router $r): void {
+                $r->get('/boom', static function (): Response {
+                    throw new HttpException(404, 'Missing');
+                });
+            });
+        $errRes = $hdrApp->handle(Request::create('GET', '/boom'));
+        self::assertSame(404, $errRes->getStatusCode());
+        self::assertSame('nosniff', $errRes->getHeaderLine('X-Content-Type-Options'));
+        self::assertSame('DENY', $errRes->getHeaderLine('X-Frame-Options'));
     }
 }
 

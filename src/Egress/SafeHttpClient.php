@@ -33,12 +33,17 @@ final readonly class SafeHttpClient
     ) {}
 
     /**
-     * Validate a target URL and resolve its admitted IP address (without performing network I/O).
+     * Validate a target URL, normalize its host (ASCII / punycode), reconstruct a canonical URL,
+     * and resolve its admitted IP address (without performing network I/O).
      *
-     * @return array{scheme: string, host: string, port: int, ip: string}
+     * @return array{scheme: string, host: string, port: int, ip: string, url: string}
      */
     public function admitTarget(string $url): array
     {
+        if ('' === $url || 1 === preg_match('/[\x00-\x1f\x7f\\\\]/', $url)) {
+            throw new SecurityException('Outbound URL contains forbidden control characters or backslashes.');
+        }
+
         $parts = parse_url($url);
         if (false === $parts || !isset($parts['scheme'], $parts['host'])) {
             throw new SecurityException('Outbound URL must include valid scheme and host.');
@@ -53,7 +58,7 @@ final readonly class SafeHttpClient
             throw new SecurityException('Embedded credentials in outbound URLs are forbidden.');
         }
 
-        $host = strtolower($parts['host']);
+        $host = $this->normalizeHost($parts['host']);
         $port = $parts['port'] ?? ('https' === $scheme ? 443 : 80);
         if ($port < 1) {
             throw new SecurityException(sprintf('Invalid outbound port %d.', $port));
@@ -75,7 +80,9 @@ final readonly class SafeHttpClient
             }
         }
 
-        return ['scheme' => $scheme, 'host' => $host, 'port' => $port, 'ip' => $ips[0]];
+        $canonicalUrl = $this->buildCanonicalUrl($scheme, $host, $port, $parts);
+
+        return ['scheme' => $scheme, 'host' => $host, 'port' => $port, 'ip' => $ips[0], 'url' => $canonicalUrl];
     }
 
     /**
@@ -86,14 +93,10 @@ final readonly class SafeHttpClient
      */
     public function request(string $method, string $url, array $headers = [], ?string $body = null, int $timeoutSeconds = 15): array
     {
-        $upperMethod = strtoupper(trim($method));
-        if ('' === $upperMethod) {
-            throw new SecurityException('Outbound HTTP method cannot be empty.');
-        }
-
+        $upperMethod = $this->normalizeMethod($method);
         $target = $this->admitTarget($url);
 
-        $ch = curl_init($url);
+        $ch = curl_init($target['url']);
         if (false === $ch) {
             throw new SecurityException('Unable to initialize cURL handle.');
         }
@@ -164,16 +167,12 @@ final readonly class SafeHttpClient
         }
 
         // Fail closed upfront: admit every target URL & IP BEFORE launching any transfer
-        /** @var array<TKey, array{method: non-empty-string, url: string, headers: array<string, string>, body: ?string, timeout: int, target: array{scheme: string, host: string, port: int, ip: string}}> $prepared */
+        /** @var array<TKey, array{method: non-empty-string, headers: array<string, string>, body: ?string, timeout: int, target: array{scheme: string, host: string, port: int, ip: string, url: string}}> $prepared */
         $prepared = [];
         foreach ($requests as $key => $req) {
-            $upperMethod = strtoupper(trim($req['method'] ?? 'GET'));
-            if ('' === $upperMethod) {
-                throw new SecurityException('Outbound HTTP method cannot be empty.');
-            }
+            $upperMethod = $this->normalizeMethod($req['method'] ?? 'GET');
             $prepared[$key] = [
                 'method' => $upperMethod,
-                'url' => $req['url'],
                 'headers' => $req['headers'] ?? [],
                 'body' => $req['body'] ?? null,
                 'timeout' => $req['timeout'] ?? 15,
@@ -192,7 +191,7 @@ final readonly class SafeHttpClient
 
         try {
             foreach ($prepared as $key => $item) {
-                $ch = curl_init($item['url']);
+                $ch = curl_init($item['target']['url']);
                 if (false === $ch) {
                     throw new SecurityException('Unable to initialize cURL handle.');
                 }
@@ -284,31 +283,46 @@ final readonly class SafeHttpClient
             return false;
         }
 
-        // Unwrap IPv4-mapped IPv6 (::ffff:a.b.c.d / ::ffff:xxxx:xxxx) and 6to4 (2002::/16) / Teredo / NAT64
+        // Unwrap IPv4-mapped IPv6 and reject reserved/tunneled/special-purpose IPv6 prefixes
         if (16 === strlen($packed)) {
+            // ::ffff:0:0/96 (IPv4-mapped IPv6)
             if (str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff")) {
                 $mappedV4 = @inet_ntop(substr($packed, 12, 4));
 
                 return is_string($mappedV4) && $this->isIpAdmitted($mappedV4);
             }
-            // Reject ::, ::1, fc00::/7 (ULA), fe80::/10 (link-local), ff00::/8 (multicast), 100::/64, 64:ff9b::/96 (NAT64)
+            // ::/96 (deprecated IPv4-compatible), ::ffff:0:0:0/96 (IPv4-translated),
+            // 64:ff9b::/96 & 64:ff9b:1::/48 (NAT64), 100::/64 (discard), 2001::/32 (Teredo),
+            // 2001:10::/28 & 2001:20::/28 (ORCHID), 2001:db8::/32 (documentation),
+            // 2002::/16 (6to4), fc00::/7 (ULA), fe80::/10 (link-local), fec0::/10 (site-local), ff00::/8 (multicast)
             $b0 = ord($packed[0]);
             $b1 = ord($packed[1]);
+            $b2 = ord($packed[2]);
+            $b3 = ord($packed[3]);
             if (
-                $packed === str_repeat("\x00", 16)
-                || $packed === str_repeat("\x00", 15) . "\x01"
+                str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+                || str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00")
+                || str_starts_with($packed, "\x00\x64\xff\x9b\x00\x00\x00\x00\x00\x00\x00\x00")
+                || str_starts_with($packed, "\x00\x64\xff\x9b\x00\x01")
+                || str_starts_with($packed, "\x01\x00\x00\x00\x00\x00\x00\x00")
+                || (0x20 === $b0 && 0x01 === $b1 && 0x00 === $b2 && 0x00 === $b3)
+                || (0x20 === $b0 && 0x01 === $b1 && 0x00 === $b2 && ($b3 >= 0x10 && $b3 <= 0x2f))
+                || (0x20 === $b0 && 0x01 === $b1 && 0x0d === $b2 && 0xb8 === $b3)
+                || (0x20 === $b0 && 0x02 === $b1)
                 || 0xfc === ($b0 & 0xfe)
                 || (0xfe === $b0 && 0x80 === ($b1 & 0xc0))
+                || (0xfe === $b0 && 0xc0 === ($b1 & 0xc0))
                 || 0xff === $b0
-                || str_starts_with($packed, "\x00\x64\xff\x9b\x00\x00\x00\x00\x00\x00\x00\x00")
             ) {
                 return false;
             }
         } elseif (4 === strlen($packed)) {
             $o0 = ord($packed[0]);
             $o1 = ord($packed[1]);
+            $o2 = ord($packed[2]);
             // Block 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10 (CGNAT), 127.0.0.0/8, 169.254.0.0/16 (IMDS),
-            // 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 (multicast), 240.0.0.0/4 (reserved)
+            // 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16,
+            // 198.18.0.0/15 (RFC 2544), 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4
             if (
                 0 === $o0
                 || 10 === $o0
@@ -316,7 +330,12 @@ final readonly class SafeHttpClient
                 || 127 === $o0
                 || (169 === $o0 && 254 === $o1)
                 || (172 === $o0 && $o1 >= 16 && $o1 <= 31)
+                || (192 === $o0 && 0 === $o1 && (0 === $o2 || 2 === $o2))
+                || (192 === $o0 && 88 === $o1 && 99 === $o2)
                 || (192 === $o0 && 168 === $o1)
+                || (198 === $o0 && (18 === $o1 || 19 === $o1))
+                || (198 === $o0 && 51 === $o1 && 100 === $o2)
+                || (203 === $o0 && 0 === $o1 && 113 === $o2)
                 || $o0 >= 224
             ) {
                 return false;
@@ -324,6 +343,68 @@ final readonly class SafeHttpClient
         }
 
         return false !== filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+
+    /** @return non-empty-string */
+    private function normalizeMethod(string $method): string
+    {
+        $upper = strtoupper(trim($method));
+        if ('' === $upper || 1 !== preg_match('/\A[A-Z!#$%&\'*+\-.^_`|~]{1,32}\z/', $upper)) {
+            throw new SecurityException(sprintf('Invalid outbound HTTP method "%s".', $method));
+        }
+
+        return $upper;
+    }
+
+    private function normalizeHost(string $rawHost): string
+    {
+        if ('' === $rawHost || str_contains($rawHost, '%') || 1 === preg_match('/[\s\x00-\x1f\x7f\\\\]/', $rawHost)) {
+            throw new SecurityException('Outbound host contains forbidden characters or percent-encoding.');
+        }
+
+        if (str_starts_with($rawHost, '[') && str_ends_with($rawHost, ']')) {
+            $inner = substr($rawHost, 1, -1);
+            if (false === filter_var($inner, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                throw new SecurityException('Invalid bracketed IPv6 outbound host.');
+            }
+
+            return '[' . strtolower($inner) . ']';
+        }
+
+        $host = strtolower($rawHost);
+        if (1 === preg_match('/[^\x20-\x7e]/', $host)) {
+            if (!function_exists('idn_to_ascii')) {
+                throw new SecurityException('Non-ASCII IDN outbound hosts require ext-intl for safe punycode pinning.');
+            }
+            $ascii = idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+            if (!is_string($ascii) || '' === $ascii) {
+                throw new SecurityException('Unable to canonicalize IDN outbound hostname.');
+            }
+            $host = strtolower($ascii);
+        }
+
+        if (
+            false === filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+            && 1 !== preg_match('/\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\z/', $host)
+        ) {
+            throw new SecurityException(sprintf('Invalid outbound hostname "%s".', $rawHost));
+        }
+
+        return $host;
+    }
+
+    /** @param array<string, int|string> $parts */
+    private function buildCanonicalUrl(string $scheme, string $host, int $port, array $parts): string
+    {
+        $defaultPort = 'https' === $scheme ? 443 : 80;
+        $authority = $port === $defaultPort ? $host : $host . ':' . $port;
+        $path = is_string($parts['path'] ?? null) && '' !== $parts['path'] ? $parts['path'] : '/';
+        if (!str_starts_with($path, '/')) {
+            $path = '/' . $path;
+        }
+        $query = is_string($parts['query'] ?? null) && '' !== $parts['query'] ? '?' . $parts['query'] : '';
+
+        return sprintf('%s://%s%s%s', $scheme, $authority, $path, $query);
     }
 
     /** @return list<string> */

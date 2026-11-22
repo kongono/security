@@ -13,6 +13,8 @@ use SensitiveParameter;
 final readonly class WebhookSigner
 {
     public const string DEFAULT_HEADER = 'X-Kongono-Signature';
+    private const int MAX_SIGNATURE_CANDIDATES = 5;
+    private const int MAX_FUTURE_SKEW_SECONDS = 60;
 
     public function __construct(
         #[SensitiveParameter]
@@ -32,9 +34,22 @@ final readonly class WebhookSigner
         return sprintf('t=%d,v1=%s', $ts, $sig);
     }
 
-    /** Verify a `t=<timestamp>,v1=<hmac>` header with replay-window enforcement. */
+    /** Verify a `t=<timestamp>,v1=<hmac>` header with strict parsing and replay-window enforcement. */
     public function verify(string $payload, string $signatureHeader, int $toleranceSeconds = 300, ?int $now = null): bool
     {
+        return null !== $this->verifyAndFingerprint($payload, $signatureHeader, $toleranceSeconds, $now);
+    }
+
+    /**
+     * Verify a webhook signature and return a deterministic SHA-256 replay-deduplication fingerprint,
+     * or null if verification fails.
+     */
+    public function verifyAndFingerprint(string $payload, string $signatureHeader, int $toleranceSeconds = 300, ?int $now = null): ?string
+    {
+        if ('' === $signatureHeader || strlen($signatureHeader) > 2048) {
+            return null;
+        }
+
         $timestamp = null;
         $signatures = [];
 
@@ -43,29 +58,40 @@ final readonly class WebhookSigner
             if (2 !== count($kv)) {
                 continue;
             }
-            if ('t' === $kv[0] && ctype_digit($kv[1])) {
+            if ('t' === $kv[0]) {
+                // Reject duplicate or non-numeric timestamps to prevent parser ambiguity
+                if (null !== $timestamp || !ctype_digit($kv[1])) {
+                    return null;
+                }
                 $timestamp = (int) $kv[1];
-            } elseif ('v1' === $kv[0] && '' !== $kv[1]) {
-                $signatures[] = $kv[1];
+            } elseif ('v1' === $kv[0]) {
+                if (count($signatures) >= self::MAX_SIGNATURE_CANDIDATES) {
+                    return null;
+                }
+                if (64 === strlen($kv[1]) && ctype_xdigit($kv[1])) {
+                    $signatures[] = strtolower($kv[1]);
+                }
             }
         }
 
         if (null === $timestamp || [] === $signatures) {
-            return false;
+            return null;
         }
 
         $current = $now ?? time();
-        if (abs($current - $timestamp) > max(1, $toleranceSeconds)) {
-            return false;
+        $maxPast = max(1, $toleranceSeconds);
+        $maxFuture = min(self::MAX_FUTURE_SKEW_SECONDS, $maxPast);
+        if (($current - $timestamp) > $maxPast || ($timestamp - $current) > $maxFuture) {
+            return null;
         }
 
         $expected = hash_hmac('sha256', $timestamp . '.' . $payload, $this->secret);
         foreach ($signatures as $candidate) {
             if (hash_equals($expected, $candidate)) {
-                return true;
+                return hash('sha256', $timestamp . ':' . $expected);
             }
         }
 
-        return false;
+        return null;
     }
 }

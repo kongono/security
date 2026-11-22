@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Kongono\Security\Middleware;
 
 use Closure;
+use Kongono\Core\Cache\AtomicCacheInterface;
 use Kongono\Core\Cache\CacheInterface;
+use Kongono\Http\HttpException;
 use Kongono\Http\Response;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
@@ -88,7 +90,17 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
             ]);
         }
 
-        $response = $handler->handle($request);
+        try {
+            $response = $handler->handle($request);
+        } catch (HttpException $e) {
+            if (401 === $e->statusCode || 404 === $e->statusCode || 405 === $e->statusCode) {
+                $probes = $this->incrementProbes($clientId);
+                if ($probes >= $this->maxProbesPerWindow) {
+                    $this->ban($clientId, 'recon_burst');
+                }
+            }
+            throw $e;
+        }
 
         $status = $response->getStatusCode();
         if (401 === $status || 404 === $status || 405 === $status) {
@@ -123,10 +135,16 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
     public function recordCostUnits(string $clientId, int $units): int
     {
         $key = $this->costKey($clientId);
+        $delta = max(0, $units);
+        $ttl = max(1, $this->costWindowSeconds) + 1;
+        if ($this->cache instanceof AtomicCacheInterface) {
+            return $this->cache->increment($key, $delta, $ttl);
+        }
+
         $raw = $this->cache->get($key, 0);
         $current = is_int($raw) ? $raw : 0;
-        $updated = $current + max(0, $units);
-        $this->cache->set($key, $updated, max(1, $this->costWindowSeconds) + 1);
+        $updated = $current + $delta;
+        $this->cache->set($key, $updated, $ttl);
 
         return $updated;
     }
@@ -152,18 +170,39 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
 
     /**
      * Canonicalize request paths before honeypot matching to defeat evasion via
-     * `//.env`, `/./.env`, `/%2eenv`, `\.env`, or trailing dots/slashes (`/.env.`).
+     * `//.env`, `/../.env`, `/foo/../.env`, `/%2e%2e/.env`, `\.env`, `/.env;foo`, or trailing dots.
      */
     private function canonicalizePath(string $rawPath): string
     {
-        $decoded = str_replace(["\0", '\\'], ['', '/'], rawurldecode($rawPath));
+        $decoded = $rawPath;
+        for ($i = 0; $i < 2; ++$i) {
+            $next = rawurldecode($decoded);
+            if ($next === $decoded) {
+                break;
+            }
+            $decoded = $next;
+        }
+        $decoded = str_replace(["\0", '\\'], ['', '/'], $decoded);
         $collapsed = (string) preg_replace('#/+#', '/', '/' . ltrim($decoded, '/'));
         $segments = [];
         foreach (explode('/', $collapsed) as $seg) {
+            // Strip RFC 3986 matrix parameters (e.g. /.env;foo=bar)
+            $semi = strpos($seg, ';');
+            if (false !== $semi) {
+                $seg = substr($seg, 0, $semi);
+            }
             if ('' === $seg || '.' === $seg) {
                 continue;
             }
-            $segments[] = rtrim($seg, '.');
+            if ('..' === $seg) {
+                array_pop($segments);
+                continue;
+            }
+            $cleaned = rtrim($seg, '. ');
+            if ('' === $cleaned) {
+                continue;
+            }
+            $segments[] = $cleaned;
         }
 
         return '/' . strtolower(implode('/', $segments));
@@ -187,11 +226,16 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
 
     private function incrementProbes(string $clientId): int
     {
-        $bucket = (int) floor(time() / max(1, $this->probeWindowSeconds));
+        $window = max(1, $this->probeWindowSeconds);
+        $bucket = (int) floor(time() / $window);
         $key = sprintf('threat_shield:probes:%s:%d', hash('sha256', $clientId), $bucket);
+        if ($this->cache instanceof AtomicCacheInterface) {
+            return $this->cache->increment($key, 1, $window + 1);
+        }
+
         $raw = $this->cache->get($key, 0);
         $next = (is_int($raw) ? $raw : 0) + 1;
-        $this->cache->set($key, $next, max(1, $this->probeWindowSeconds) + 1);
+        $this->cache->set($key, $next, $window + 1);
 
         return $next;
     }

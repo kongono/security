@@ -4,12 +4,13 @@ declare(strict_types=1);
 
 namespace Kongono\Security\Middleware;
 
+use Kongono\Http\HttpException;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 
-/** Applies hardened modern HTTP security headers by default (CSP, nosniff, XFO, Referrer, Permissions, HTTPS HSTS). */
+/** Applies hardened modern HTTP security headers by default (CSP, nosniff, XFO, Referrer, Permissions, HTTPS HSTS) including on error responses. */
 final readonly class SecurityHeadersMiddleware implements MiddlewareInterface
 {
     public function __construct(
@@ -22,34 +23,48 @@ final readonly class SecurityHeadersMiddleware implements MiddlewareInterface
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
-        $response = $handler->handle($request);
-
-        if (!$response->hasHeader('X-Content-Type-Options')) {
-            $response = $response->withHeader('X-Content-Type-Options', 'nosniff');
-        }
-        if (!$response->hasHeader('X-Frame-Options')) {
-            $response = $response->withHeader('X-Frame-Options', $this->frameOptions);
-        }
-        if (!$response->hasHeader('Referrer-Policy')) {
-            $response = $response->withHeader('Referrer-Policy', $this->referrerPolicy);
-        }
-        if ('' !== $this->permissionsPolicy && !$response->hasHeader('Permissions-Policy')) {
-            $response = $response->withHeader('Permissions-Policy', $this->permissionsPolicy);
-        }
-        if ('' !== $this->contentSecurityPolicy && !$response->hasHeader('Content-Security-Policy')) {
-            $response = $response->withHeader('Content-Security-Policy', $this->contentSecurityPolicy);
-        }
-        if (
-            $this->hstsMaxAgeSeconds > 0
-            && 'https' === strtolower($request->getUri()->getScheme())
-            && !$response->hasHeader('Strict-Transport-Security')
-        ) {
-            $response = $response->withHeader(
-                'Strict-Transport-Security',
-                sprintf('max-age=%d; includeSubDomains', $this->hstsMaxAgeSeconds),
+        try {
+            $response = $handler->handle($request);
+        } catch (HttpException $e) {
+            $mergedHeaders = $this->defaultHeadersFor($request);
+            foreach ($e->headers as $name => $value) {
+                $mergedHeaders[$name] = $value;
+            }
+            throw new HttpException(
+                statusCode: $e->statusCode,
+                message: $e->getMessage(),
+                headers: $mergedHeaders,
+                previous: $e,
             );
         }
 
+        foreach ($this->defaultHeadersFor($request) as $name => $value) {
+            if (!$response->hasHeader($name)) {
+                $response = $response->withHeader($name, $value);
+            }
+        }
+
         return $response;
+    }
+
+    /** @return array<string, string> */
+    private function defaultHeadersFor(ServerRequestInterface $request): array
+    {
+        $headers = [
+            'X-Content-Type-Options' => 'nosniff',
+            'X-Frame-Options' => $this->frameOptions,
+            'Referrer-Policy' => $this->referrerPolicy,
+        ];
+        if ('' !== $this->permissionsPolicy) {
+            $headers['Permissions-Policy'] = $this->permissionsPolicy;
+        }
+        if ('' !== $this->contentSecurityPolicy) {
+            $headers['Content-Security-Policy'] = $this->contentSecurityPolicy;
+        }
+        if ($this->hstsMaxAgeSeconds > 0 && 'https' === strtolower($request->getUri()->getScheme())) {
+            $headers['Strict-Transport-Security'] = sprintf('max-age=%d; includeSubDomains', $this->hstsMaxAgeSeconds);
+        }
+
+        return $headers;
     }
 }

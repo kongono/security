@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kongono\Security\Auth;
 
+use Kongono\Core\Cache\AtomicCacheInterface;
 use Kongono\Core\Cache\CacheInterface;
 use Kongono\Security\SecurityException;
 use Kongono\Security\SignedUrl;
@@ -75,20 +76,23 @@ final readonly class MagicLinkAuth
         if (false === $parts || !isset($parts['query'])) {
             throw new SecurityException('Magic link is missing query parameters.');
         }
-        parse_str($parts['query'], $params);
-        $nonce = $params['nonce'] ?? null;
+        $params = SignedUrl::parseStrictQuery($parts['query']);
+        $nonce = is_array($params) ? ($params['nonce'] ?? null) : null;
         if (!is_string($nonce) || '' === $nonce) {
             throw new SecurityException('Magic link nonce is missing.');
         }
 
         $cacheKey = $this->cachePrefix . hash('sha256', $nonce);
-        $raw = $this->cache->get($cacheKey);
+        // Atomic single-use consumption (prevents concurrent replay races)
+        if ($this->cache instanceof AtomicCacheInterface) {
+            $raw = $this->cache->pull($cacheKey);
+        } else {
+            $raw = $this->cache->get($cacheKey);
+            $this->cache->delete($cacheKey);
+        }
         if (!is_string($raw) || '' === $raw) {
             throw new SecurityException('Magic link has already been consumed or expired.');
         }
-
-        // Single-use: invalidate immediately before returning
-        $this->cache->delete($cacheKey);
 
         $decoded = json_decode($raw, true);
         if (!is_array($decoded) || !is_string($decoded['email'] ?? null)) {

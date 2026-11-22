@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kongono\Security\Auth;
 
+use Kongono\Core\Cache\AtomicCacheInterface;
 use Kongono\Core\Cache\CacheInterface;
 use Kongono\Security\SecurityException;
 
@@ -61,7 +62,8 @@ final readonly class PasskeyVerifier
     /**
      * Verify a WebAuthn authentication assertion (`navigator.credentials.get()`).
      *
-     * @param 'ES256'|'EdDSA' $algorithm
+     * @param string       $algorithm         Supported: 'ES256' or 'EdDSA'
+     * @param list<string> $allowedTopOrigins Explicit top-level origins allowed when $allowCrossOrigin is true
      * @return array{signCount: int, userPresent: bool, userVerified: bool}
      */
     public function verifyAssertion(
@@ -75,15 +77,19 @@ final readonly class PasskeyVerifier
         bool $requireUserVerification = false,
         ?int $now = null,
         bool $allowCrossOrigin = false,
+        array $allowedTopOrigins = [],
     ): array {
         $cacheKey = $this->challengeKey($expectedChallenge);
-        $rawChallengeMeta = $this->cache->get($cacheKey);
+        // Atomic single-use challenge consumption (prevents concurrent replay races)
+        if ($this->cache instanceof AtomicCacheInterface) {
+            $rawChallengeMeta = $this->cache->pull($cacheKey);
+        } else {
+            $rawChallengeMeta = $this->cache->get($cacheKey);
+            $this->cache->delete($cacheKey);
+        }
         if (!is_string($rawChallengeMeta) || '' === $rawChallengeMeta) {
             throw new SecurityException('Passkey challenge is unknown, expired, or already consumed.');
         }
-
-        // Single-use challenge consumption (prevents replay even if assertion fails)
-        $this->cache->delete($cacheKey);
 
         $meta = json_decode($rawChallengeMeta, true);
         if (!is_array($meta) || !is_string($meta['rpId'] ?? null) || !is_string($meta['origin'] ?? null) || !is_int($meta['expiresAt'] ?? null)) {
@@ -114,8 +120,24 @@ final readonly class PasskeyVerifier
             throw new SecurityException('Passkey origin mismatch.');
         }
 
-        if (!$allowCrossOrigin && true === ($clientData['crossOrigin'] ?? false)) {
-            throw new SecurityException('Cross-origin passkey assertions are denied by policy.');
+        if (array_key_exists('crossOrigin', $clientData) && !is_bool($clientData['crossOrigin'])) {
+            throw new SecurityException('Passkey crossOrigin flag must be a boolean.');
+        }
+        $isCrossOrigin = true === ($clientData['crossOrigin'] ?? false);
+        if ($isCrossOrigin) {
+            if (!$allowCrossOrigin) {
+                throw new SecurityException('Cross-origin passkey assertions are denied by policy.');
+            }
+            $topOrigin = is_string($clientData['topOrigin'] ?? null) ? rtrim($clientData['topOrigin'], '/') : '';
+            $matchedTopOrigin = false;
+            foreach ($allowedTopOrigins as $allowedTop) {
+                if ('' !== $topOrigin && hash_equals(rtrim($allowedTop, '/'), $topOrigin)) {
+                    $matchedTopOrigin = true;
+                }
+            }
+            if (!$matchedTopOrigin) {
+                throw new SecurityException('Cross-origin passkey topOrigin is missing or not allowlisted.');
+            }
         }
 
         $authData = self::base64UrlDecode($authenticatorDataBase64Url);
@@ -132,16 +154,26 @@ final readonly class PasskeyVerifier
         $flags = ord($authData[32]);
         $userPresent = 0 !== ($flags & 0x01);
         $userVerified = 0 !== ($flags & 0x04);
+        $backupEligible = 0 !== ($flags & 0x08);
+        $backupState = 0 !== ($flags & 0x10);
+        $attestedDataIncluded = 0 !== ($flags & 0x40);
         if (!$userPresent) {
             throw new SecurityException('Passkey User Present (UP) flag is not set.');
         }
         if ($requireUserVerification && !$userVerified) {
             throw new SecurityException('Passkey User Verified (UV) flag is required but not set.');
         }
+        if ($backupState && !$backupEligible) {
+            throw new SecurityException('Invalid passkey authenticatorData flags (BS set without BE).');
+        }
+        if ($attestedDataIncluded) {
+            throw new SecurityException('Unexpected attested credential data flag (AT) in passkey assertion.');
+        }
 
         $unpacked = unpack('Ncount', substr($authData, 33, 4));
         $signCount = is_array($unpacked) && is_int($unpacked['count'] ?? null) ? $unpacked['count'] : 0;
-        if ($signCount > 0 && $signCount <= $previousSignCount) {
+        // W3C WebAuthn §7.2 Step 21: reject if EITHER signCount or previousSignCount > 0 and signCount did not advance
+        if (($signCount > 0 || $previousSignCount > 0) && $signCount <= $previousSignCount) {
             throw new SecurityException('Passkey signCount did not advance (possible cloned authenticator).');
         }
 
@@ -151,6 +183,7 @@ final readonly class PasskeyVerifier
         $valid = match ($algorithm) {
             'ES256' => $this->verifyEs256($signedPayload, $signature, $publicKey),
             'EdDSA' => $this->verifyEd25519($signedPayload, $signature, $publicKey),
+            default => throw new SecurityException(sprintf('Unsupported passkey algorithm "%s".', $algorithm)),
         };
 
         if (!$valid) {
@@ -189,6 +222,15 @@ final readonly class PasskeyVerifier
         $key = openssl_pkey_get_public($publicKeyPem);
         if (false === $key) {
             throw new SecurityException('Invalid ES256 PEM public key.');
+        }
+        $details = openssl_pkey_get_details($key);
+        if (
+            false === $details
+            || OPENSSL_KEYTYPE_EC !== ($details['type'] ?? null)
+            || !is_array($details['ec'] ?? null)
+            || 'prime256v1' !== ($details['ec']['curve_name'] ?? null)
+        ) {
+            throw new SecurityException('ES256 requires an ECDSA P-256 (prime256v1) public key.');
         }
 
         return 1 === openssl_verify($signedPayload, $signature, $key, OPENSSL_ALGO_SHA256);
