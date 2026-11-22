@@ -15,6 +15,9 @@ use Kongono\Http\Routing\Post;
 use Kongono\Http\Routing\Router;
 use Kongono\Security\Attributes\Can;
 use Kongono\Security\Attributes\VerifyWebhook;
+use Kongono\Security\Auth\MagicLinkAuth;
+use Kongono\Security\Auth\PasskeyVerifier;
+use Kongono\Security\Auth\PkceOAuthClient;
 use Kongono\Security\Egress\SafeHttpClient;
 use Kongono\Security\Encryptor;
 use Kongono\Security\Gate;
@@ -370,6 +373,121 @@ final class SecurityTest extends TestCase
             'safe' => ['url' => 'https://api.example.com/v1/status'],
             'ssrf' => ['url' => 'https://internal.local/admin'],
         ]);
+    }
+
+    public function testZeroVendorAuthSuiteMagicLinkPkceOAuthAndPasskeys(): void
+    {
+        $cache = new MemoryCache();
+
+        // 1. Single-use Magic Link auth
+        $magic = new MagicLinkAuth('super-secret-magic-link-signing-key-32bytes', $cache);
+        $link = $magic->createLink('/auth/magic', 'Ada@Kongono.dev', ttlSeconds: 600, claims: ['role' => 'owner'], now: 1000);
+        $consumed = $magic->consume($link, now: 1100);
+        self::assertSame('ada@kongono.dev', $consumed['email']);
+        self::assertSame(['role' => 'owner'], $consumed['claims']);
+
+        // Replaying the same magic link fails closed
+        try {
+            $magic->consume($link, now: 1105);
+            self::fail('Expected replayed magic link to fail.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('already been consumed', $e->getMessage());
+        }
+
+        // 2. PKCE S256 OAuth2 Client (GitHub & Google presets)
+        $oauthCalls = [];
+        $github = PkceOAuthClient::github(
+            clientId: 'gh_client_1',
+            clientSecret: 'gh_secret_1',
+            transportOverride: static function (string $method, string $url, array $headers, ?string $body) use (&$oauthCalls): array {
+                $oauthCalls[] = [$method, $url, $body];
+                if (str_contains($url, 'access_token')) {
+                    return ['status' => 200, 'body' => '{"access_token":"gho_test_token","token_type":"bearer"}'];
+                }
+
+                return ['status' => 200, 'body' => '{"id":7,"login":"ada","email":"ada@kongono.dev"}'];
+            },
+        );
+        $authStart = $github->beginAuthorization('https://app.kongono.dev/auth/github/callback');
+        self::assertStringStartsWith('https://github.com/login/oauth/authorize?', $authStart['url']);
+        self::assertStringContainsString('code_challenge_method=S256', $authStart['url']);
+        $expectedChallenge = PasskeyVerifier::base64UrlEncode(hash('sha256', $authStart['code_verifier'], true));
+        self::assertSame($expectedChallenge, $authStart['code_challenge']);
+
+        $github->verifyState($authStart['state'], $authStart['state']);
+        $tokens = $github->exchangeCode('auth_code_123', 'https://app.kongono.dev/auth/github/callback', $authStart['code_verifier']);
+        self::assertSame('gho_test_token', $tokens['access_token']);
+        $profile = $github->fetchUserInfo('gho_test_token');
+        self::assertSame('ada', $profile['login']);
+        self::assertCount(2, $oauthCalls);
+
+        // 3. Pure PHP WebAuthn / FIDO2 Passkey verification (EdDSA Ed25519)
+        $passkeys = new PasskeyVerifier($cache);
+        $challengeData = $passkeys->createChallenge('kongono.dev', 'https://kongono.dev', ttlSeconds: 300, now: 2000);
+
+        $kp = sodium_crypto_sign_keypair();
+        $secretKey = sodium_crypto_sign_secretkey($kp);
+        $publicKeyHex = bin2hex(sodium_crypto_sign_publickey($kp));
+
+        $clientDataRaw = json_encode([
+            'type' => 'webauthn.get',
+            'challenge' => $challengeData['challenge'],
+            'origin' => 'https://kongono.dev',
+        ], JSON_THROW_ON_ERROR);
+        $authData = hash('sha256', 'kongono.dev', true) . chr(0x05) . pack('N', 4); // UP|UV flags, signCount=4
+        $signature = sodium_crypto_sign_detached($authData . hash('sha256', $clientDataRaw, true), $secretKey);
+
+        $verified = $passkeys->verifyAssertion(
+            expectedChallenge: $challengeData['challenge'],
+            clientDataJsonBase64Url: PasskeyVerifier::base64UrlEncode($clientDataRaw),
+            authenticatorDataBase64Url: PasskeyVerifier::base64UrlEncode($authData),
+            signatureBase64Url: PasskeyVerifier::base64UrlEncode($signature),
+            publicKey: $publicKeyHex,
+            algorithm: 'EdDSA',
+            previousSignCount: 3,
+            requireUserVerification: true,
+            now: 2050,
+        );
+        self::assertSame(4, $verified['signCount']);
+        self::assertTrue($verified['userPresent']);
+        self::assertTrue($verified['userVerified']);
+
+        // Replay of consumed WebAuthn challenge fails closed
+        try {
+            $passkeys->verifyAssertion(
+                expectedChallenge: $challengeData['challenge'],
+                clientDataJsonBase64Url: PasskeyVerifier::base64UrlEncode($clientDataRaw),
+                authenticatorDataBase64Url: PasskeyVerifier::base64UrlEncode($authData),
+                signatureBase64Url: PasskeyVerifier::base64UrlEncode($signature),
+                publicKey: $publicKeyHex,
+                algorithm: 'EdDSA',
+                now: 2055,
+            );
+            self::fail('Expected replayed passkey challenge to fail.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('already consumed', $e->getMessage());
+        }
+
+        // Cloned authenticator signCount rollback fails closed
+        $c2 = $passkeys->createChallenge('kongono.dev', 'https://kongono.dev', now: 2100);
+        $cd2 = json_encode(['type' => 'webauthn.get', 'challenge' => $c2['challenge'], 'origin' => 'https://kongono.dev'], JSON_THROW_ON_ERROR);
+        $ad2 = hash('sha256', 'kongono.dev', true) . chr(0x01) . pack('N', 4);
+        $sig2 = sodium_crypto_sign_detached($ad2 . hash('sha256', $cd2, true), $secretKey);
+        try {
+            $passkeys->verifyAssertion(
+                expectedChallenge: $c2['challenge'],
+                clientDataJsonBase64Url: PasskeyVerifier::base64UrlEncode($cd2),
+                authenticatorDataBase64Url: PasskeyVerifier::base64UrlEncode($ad2),
+                signatureBase64Url: PasskeyVerifier::base64UrlEncode($sig2),
+                publicKey: $publicKeyHex,
+                algorithm: 'EdDSA',
+                previousSignCount: 4,
+                now: 2110,
+            );
+            self::fail('Expected cloned authenticator signCount rollback to fail.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('cloned authenticator', $e->getMessage());
+        }
     }
 }
 
