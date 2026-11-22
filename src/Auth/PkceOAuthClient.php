@@ -34,6 +34,12 @@ final readonly class PkceOAuthClient
         if ('' === trim($clientId)) {
             throw new SecurityException('OAuth client ID cannot be empty.');
         }
+        if ('' === trim($authorizeUrl) || !str_starts_with(strtolower($authorizeUrl), 'https://') || 1 === preg_match('/[\x00-\x1f\x7f]/', $authorizeUrl)) {
+            throw new SecurityException('OAuth authorizeUrl must be a valid https:// URL.');
+        }
+        if ('' === trim($tokenUrl) || !str_starts_with(strtolower($tokenUrl), 'https://') || 1 === preg_match('/[\x00-\x1f\x7f]/', $tokenUrl)) {
+            throw new SecurityException('OAuth tokenUrl must be a valid https:// URL.');
+        }
     }
 
     /**
@@ -156,6 +162,13 @@ final readonly class PkceOAuthClient
         if (!is_array($decoded)) {
             throw new SecurityException('OAuth token endpoint returned non-JSON payload.');
         }
+        if (isset($decoded['error'])) {
+            $errCode = is_string($decoded['error']) ? $decoded['error'] : 'oauth_error';
+            throw new SecurityException(sprintf('OAuth token exchange rejected by provider (%s).', $errCode));
+        }
+        if (!is_string($decoded['access_token'] ?? null) || '' === trim($decoded['access_token'])) {
+            throw new SecurityException('OAuth token endpoint response is missing access_token.');
+        }
 
         /** @var array<string, mixed> $decoded */
         return $decoded;
@@ -168,6 +181,9 @@ final readonly class PkceOAuthClient
      */
     public function fetchUserInfo(#[SensitiveParameter] string $accessToken): array
     {
+        if ('' === trim($accessToken) || 1 === preg_match('/[\x00-\x1f\x7f]/', $accessToken)) {
+            throw new SecurityException('OAuth access token is required and must not contain control characters.');
+        }
         if (null === $this->userInfoUrl || '' === $this->userInfoUrl) {
             throw new SecurityException('No OAuth userInfoUrl is configured for this provider.');
         }
@@ -175,7 +191,7 @@ final readonly class PkceOAuthClient
         $res = $this->send('GET', $this->userInfoUrl, [
             'Accept' => 'application/json',
             'Authorization' => 'Bearer ' . $accessToken,
-            'User-Agent' => 'Kongono-Framework/1.4',
+            'User-Agent' => 'Kongono-Framework/1.5',
         ], null);
 
         if ($res['status'] < 200 || $res['status'] >= 300) {

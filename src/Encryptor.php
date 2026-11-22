@@ -36,7 +36,8 @@ final readonly class Encryptor
     public function encrypt(#[SensitiveParameter] string $plaintext, string $associatedData = ''): string
     {
         $nonce = random_bytes(SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES);
-        $cipher = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, $associatedData, $nonce, $this->primaryKey);
+        $boundAad = 'v1.' . $associatedData;
+        $cipher = sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($plaintext, $boundAad, $nonce, $this->primaryKey);
 
         return 'v1.' . $this->b64uEncode($nonce . $cipher);
     }
@@ -49,15 +50,17 @@ final readonly class Encryptor
 
         $bytes = $this->b64uDecode(substr($payload, 3));
         $nonceLen = SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_NPUBBYTES;
-        if (null === $bytes || strlen($bytes) <= $nonceLen) {
+        $minLen = $nonceLen + SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_ABYTES;
+        if (null === $bytes || strlen($bytes) < $minLen) {
             throw new SecurityException('Corrupted encrypted payload.');
         }
 
         $nonce = substr($bytes, 0, $nonceLen);
         $cipher = substr($bytes, $nonceLen);
+        $boundAad = 'v1.' . $associatedData;
 
         foreach ([$this->primaryKey, ...$this->previousKeys] as $candidateKey) {
-            $plain = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($cipher, $associatedData, $nonce, $candidateKey);
+            $plain = sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($cipher, $boundAad, $nonce, $candidateKey);
             if (false !== $plain) {
                 return $plain;
             }
@@ -72,7 +75,7 @@ final readonly class Encryptor
             throw new SecurityException('Encryption key must be at least 16 bytes.');
         }
 
-        return hash('sha256', $rawKey, true);
+        return hash_hkdf('sha256', $rawKey, SODIUM_CRYPTO_AEAD_XCHACHA20POLY1305_IETF_KEYBYTES, 'kongono:encryptor:v1');
     }
 
     private function b64uEncode(string $bytes): string
@@ -82,13 +85,23 @@ final readonly class Encryptor
 
     private function b64uDecode(string $encoded): ?string
     {
+        // Reject non-canonical base64url strings (+, /, = padding, or non-canonical trailing bits)
+        if ('' === $encoded || 1 !== preg_match('/\A[A-Za-z0-9_-]+\z/', $encoded)) {
+            return null;
+        }
         $padded = strtr($encoded, '-_', '+/');
         $rem = strlen($padded) % 4;
+        if (1 === $rem) {
+            return null;
+        }
         if (0 !== $rem) {
             $padded .= str_repeat('=', 4 - $rem);
         }
         $decoded = base64_decode($padded, true);
+        if (false === $decoded || $this->b64uEncode($decoded) !== $encoded) {
+            return null;
+        }
 
-        return false === $decoded ? null : $decoded;
+        return $decoded;
     }
 }

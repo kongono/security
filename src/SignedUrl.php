@@ -6,24 +6,30 @@ namespace Kongono\Security;
 
 use SensitiveParameter;
 
-/** HMAC-SHA256 signed & expiring URL generator/verifier (email verification, downloads, magic links). */
+/** HMAC-SHA256 signed & expiring URL generator/verifier with HKDF domain separation (email verification, downloads, magic links). */
 final readonly class SignedUrl
 {
     private const int MAX_QUERY_PARAMS = 100;
+    private const int MAX_URL_BYTES = 8192;
+
+    private string $signingKey;
 
     public function __construct(
         #[SensitiveParameter]
-        private string $secretKey,
+        string $secretKey,
+        string $domain = 'kongono:signed-url:v1',
     ) {
         if (strlen($secretKey) < 16) {
             throw new SecurityException('SignedUrl secret key must be at least 16 bytes.');
         }
+
+        $this->signingKey = hash_hkdf('sha256', $secretKey, 32, $domain);
     }
 
     /**
      * Create a temporary signed URL valid for $ttlSeconds.
      *
-     * @param array<string, string|int> $query
+     * @param array<int|string, string|int> $query
      */
     public function temporary(string $path, int $ttlSeconds = 900, array $query = [], ?int $now = null): string
     {
@@ -35,7 +41,7 @@ final readonly class SignedUrl
     /**
      * Create a non-expiring signed URL.
      *
-     * @param array<string, string|int> $query
+     * @param array<int|string, string|int> $query
      */
     public function sign(string $path, array $query = []): string
     {
@@ -47,17 +53,18 @@ final readonly class SignedUrl
         /** @var array<string, string> $normalized */
         $normalized = [];
         foreach ($query as $k => $v) {
-            if ('' === $k || str_contains($k, '[') || str_contains($k, ']')) {
-                throw new SecurityException(sprintf('Invalid SignedUrl query key "%s".', $k));
+            $keyStr = (string) $k;
+            if ('' === $keyStr || str_contains($keyStr, '[') || str_contains($keyStr, ']')) {
+                throw new SecurityException(sprintf('Invalid SignedUrl query key "%s".', $keyStr));
             }
-            $normalized[$k] = (string) $v;
+            $normalized[$keyStr] = (string) $v;
         }
         ksort($normalized, SORT_STRING);
 
         $canonicalTarget = $this->canonicalTarget($path);
         $canonicalQuery = $this->encodeQuery($normalized);
         $base = $canonicalTarget . ('' !== $canonicalQuery ? '?' . $canonicalQuery : '');
-        $signature = hash_hmac('sha256', $base, $this->secretKey);
+        $signature = hash_hmac('sha256', $base, $this->signingKey);
         $normalized['signature'] = $signature;
 
         return $canonicalTarget . '?' . $this->encodeQuery($normalized);
@@ -66,7 +73,7 @@ final readonly class SignedUrl
     /** Verify a signed URL string (strict canonical query parsing — immune to parse_str HPP & max_input_vars smuggling). */
     public function verify(string $signedUrl, ?int $now = null): bool
     {
-        if ('' === $signedUrl || 1 === preg_match('/[\x00-\x1f\x7f]/', $signedUrl)) {
+        if ('' === $signedUrl || strlen($signedUrl) > self::MAX_URL_BYTES || 1 === preg_match('/[\x00-\x1f\x7f]/', $signedUrl)) {
             return false;
         }
 
@@ -108,13 +115,17 @@ final readonly class SignedUrl
             if (!isset($parts['scheme'], $parts['host'])) {
                 return false;
             }
-            $target = strtolower($parts['scheme']) . '://' . strtolower($parts['host']) . (isset($parts['port']) ? ':' . $parts['port'] : '');
+            $scheme = strtolower($parts['scheme']);
+            if ('https' !== $scheme && 'http' !== $scheme) {
+                return false;
+            }
+            $target = $scheme . '://' . strtolower($parts['host']) . (isset($parts['port']) ? ':' . $parts['port'] : '');
         }
         $target .= $parts['path'];
 
         $canonicalQuery = $this->encodeQuery($params);
         $base = $target . ('' !== $canonicalQuery ? '?' . $canonicalQuery : '');
-        $expected = hash_hmac('sha256', $base, $this->secretKey);
+        $expected = hash_hmac('sha256', $base, $this->signingKey);
 
         return hash_equals($expected, $signature);
     }
@@ -172,16 +183,24 @@ final readonly class SignedUrl
             throw new SecurityException('Invalid SignedUrl target path.');
         }
 
+        if (isset($parts['scheme']) !== isset($parts['host'])) {
+            throw new SecurityException('Invalid SignedUrl target: scheme and host must both be present or both omitted.');
+        }
+
         $target = '';
         if (isset($parts['scheme'], $parts['host'])) {
-            $target = strtolower($parts['scheme']) . '://' . strtolower($parts['host']) . (isset($parts['port']) ? ':' . $parts['port'] : '');
+            $scheme = strtolower($parts['scheme']);
+            if ('https' !== $scheme && 'http' !== $scheme) {
+                throw new SecurityException(sprintf('Unsupported SignedUrl scheme "%s".', $parts['scheme']));
+            }
+            $target = $scheme . '://' . strtolower($parts['host']) . (isset($parts['port']) ? ':' . $parts['port'] : '');
         }
         $target .= $parts['path'] ?? '/';
 
         return $target;
     }
 
-    /** @param array<string, string> $params */
+    /** @param array<int|string, string> $params */
     private function encodeQuery(array $params): string
     {
         if ([] === $params) {
@@ -189,7 +208,7 @@ final readonly class SignedUrl
         }
         $pairs = [];
         foreach ($params as $k => $v) {
-            $pairs[] = rawurlencode($k) . '=' . rawurlencode($v);
+            $pairs[] = rawurlencode((string) $k) . '=' . rawurlencode($v);
         }
 
         return implode('&', $pairs);

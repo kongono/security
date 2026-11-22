@@ -37,9 +37,24 @@ final readonly class VerifyWebhookMiddleware implements MiddlewareInterface
             throw new HttpException(413, 'Webhook payload exceeds maximum allowed size.');
         }
 
-        $body = (string) $stream;
-        if (strlen($body) > $this->maxBodyBytes) {
-            throw new HttpException(413, 'Webhook payload exceeds maximum allowed size.');
+        // Bounded streaming read prevents OOM when stream size is unknown (e.g. chunked transfer)
+        if ($stream->isSeekable()) {
+            $stream->rewind();
+        }
+        $body = '';
+        $limit = max(1, $this->maxBodyBytes);
+        while (!$stream->eof()) {
+            $chunk = $stream->read(min(65536, ($limit - strlen($body)) + 1));
+            if ('' === $chunk) {
+                break;
+            }
+            $body .= $chunk;
+            if (strlen($body) > $limit) {
+                throw new HttpException(413, 'Webhook payload exceeds maximum allowed size.');
+            }
+        }
+        if ($stream->isSeekable()) {
+            $stream->rewind();
         }
 
         $fingerprint = $this->signer->verifyAndFingerprint($body, $sigHeader, $this->toleranceSeconds);
@@ -49,7 +64,8 @@ final readonly class VerifyWebhookMiddleware implements MiddlewareInterface
 
         if (null !== $this->replayCache) {
             $replayKey = 'kongono:webhook:seen:' . $fingerprint;
-            $ttl = max(60, $this->toleranceSeconds * 2);
+            // Cover full tolerance window + max future skew (60s) + 60s safety margin
+            $ttl = max(1, $this->toleranceSeconds) + 120;
             if ($this->replayCache instanceof AtomicCacheInterface) {
                 if (!$this->replayCache->add($replayKey, true, $ttl)) {
                     throw new HttpException(409, 'Webhook delivery replay detected.');

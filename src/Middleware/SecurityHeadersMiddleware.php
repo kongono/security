@@ -14,7 +14,7 @@ use Psr\Http\Server\RequestHandlerInterface;
 final readonly class SecurityHeadersMiddleware implements MiddlewareInterface
 {
     public function __construct(
-        private string $contentSecurityPolicy = "default-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+        private string $contentSecurityPolicy = "default-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
         private string $frameOptions = 'DENY',
         private string $referrerPolicy = 'strict-origin-when-cross-origin',
         private string $permissionsPolicy = 'camera=(), microphone=(), geolocation=()',

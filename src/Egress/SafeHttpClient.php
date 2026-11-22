@@ -283,7 +283,7 @@ final readonly class SafeHttpClient
             return false;
         }
 
-        // Unwrap IPv4-mapped IPv6 and reject reserved/tunneled/special-purpose IPv6 prefixes
+        // Unwrap IPv4-mapped IPv6 and allowlist IANA Global Unicast 2000::/3 minus special-purpose sub-blocks
         if (16 === strlen($packed)) {
             // ::ffff:0:0/96 (IPv4-mapped IPv6)
             if (str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff")) {
@@ -291,28 +291,28 @@ final readonly class SafeHttpClient
 
                 return is_string($mappedV4) && $this->isIpAdmitted($mappedV4);
             }
-            // ::/96 (deprecated IPv4-compatible), ::ffff:0:0:0/96 (IPv4-translated),
-            // 64:ff9b::/96 & 64:ff9b:1::/48 (NAT64), 100::/64 (discard), 2001::/32 (Teredo),
-            // 2001:10::/28 & 2001:20::/28 (ORCHID), 2001:db8::/32 (documentation),
-            // 2002::/16 (6to4), fc00::/7 (ULA), fe80::/10 (link-local), fec0::/10 (site-local), ff00::/8 (multicast)
             $b0 = ord($packed[0]);
             $b1 = ord($packed[1]);
             $b2 = ord($packed[2]);
             $b3 = ord($packed[3]);
+            $b4 = ord($packed[4]);
+            $b5 = ord($packed[5]);
+
+            // Fail closed on everything outside IANA Global Unicast 2000::/3
+            // (blocks ::/8, 0100::/8, 64:ff9b::/96, 5f00::/16 SRv6, fc00::/7 ULA, fe00::/9, fe80::/10, fec0::/10, ff00::/8)
+            if (0x20 !== ($b0 & 0xe0)) {
+                return false;
+            }
+            // Deny special-purpose allocations inside 2000::/3:
+            // 2001::/32 (Teredo), 2001:2::/48 (Benchmarking), 2001:3::/32 (AMT), 2001:4:112::/48,
+            // 2001:10::/28..2001:30::/28 (ORCHID/drone), 2001:db8::/32 (Doc), 2002::/16 (6to4), 3fff::/20 (Doc RFC 9637)
             if (
-                str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
-                || str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00")
-                || str_starts_with($packed, "\x00\x64\xff\x9b\x00\x00\x00\x00\x00\x00\x00\x00")
-                || str_starts_with($packed, "\x00\x64\xff\x9b\x00\x01")
-                || str_starts_with($packed, "\x01\x00\x00\x00\x00\x00\x00\x00")
-                || (0x20 === $b0 && 0x01 === $b1 && 0x00 === $b2 && 0x00 === $b3)
-                || (0x20 === $b0 && 0x01 === $b1 && 0x00 === $b2 && ($b3 >= 0x10 && $b3 <= 0x2f))
+                (0x20 === $b0 && 0x01 === $b1 && 0x00 === $b2 && (0x00 === $b3 || 0x03 === $b3 || ($b3 >= 0x10 && $b3 <= 0x3f)))
+                || (0x20 === $b0 && 0x01 === $b1 && 0x00 === $b2 && 0x02 === $b3 && 0x00 === $b4 && 0x00 === $b5)
+                || (0x20 === $b0 && 0x01 === $b1 && 0x00 === $b2 && 0x04 === $b3 && 0x01 === $b4 && 0x12 === $b5)
                 || (0x20 === $b0 && 0x01 === $b1 && 0x0d === $b2 && 0xb8 === $b3)
                 || (0x20 === $b0 && 0x02 === $b1)
-                || 0xfc === ($b0 & 0xfe)
-                || (0xfe === $b0 && 0x80 === ($b1 & 0xc0))
-                || (0xfe === $b0 && 0xc0 === ($b1 & 0xc0))
-                || 0xff === $b0
+                || (0x3f === $b0 && 0xff === $b1 && 0x00 === ($b2 & 0xf0))
             ) {
                 return false;
             }
@@ -383,11 +383,21 @@ final readonly class SafeHttpClient
             $host = strtolower($ascii);
         }
 
-        if (
-            false === filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
-            && 1 !== preg_match('/\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\z/', $host)
-        ) {
-            throw new SecurityException(sprintf('Invalid outbound hostname "%s".', $rawHost));
+        if (strlen($host) > 253) {
+            throw new SecurityException('Outbound hostname exceeds maximum RFC length.');
+        }
+
+        if (false === filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            if (1 !== preg_match('/\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\z/', $host)) {
+                throw new SecurityException(sprintf('Invalid outbound hostname "%s".', $rawHost));
+            }
+            // WHATWG URL §3.5: reject non-canonical IPv4 forms (127.1, 0177.0.0.1, 0x7f000001, 2130706433)
+            // whose trailing label is purely numeric or hex, which libcurl canonicalizes bypassing CURLOPT_RESOLVE
+            $lastDot = strrpos($host, '.');
+            $lastLabel = false === $lastDot ? $host : substr($host, $lastDot + 1);
+            if (1 === preg_match('/\A(?:[0-9]+|0x[0-9a-f]+)\z/', $lastLabel)) {
+                throw new SecurityException(sprintf('SSRF blocked: non-canonical numeric IPv4 literal "%s" rejected.', $rawHost));
+            }
         }
 
         return $host;

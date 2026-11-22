@@ -26,7 +26,7 @@ final readonly class MagicLinkAuth
         private CacheInterface $cache,
         private string $cachePrefix = 'kongono:magic_link:',
     ) {
-        $this->signer = new SignedUrl($secretKey);
+        $this->signer = new SignedUrl($secretKey, domain: 'kongono:magic-link:v1');
     }
 
     /**

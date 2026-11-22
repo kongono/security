@@ -746,6 +746,150 @@ final class SecurityTest extends TestCase
         self::assertSame('nosniff', $errRes->getHeaderLine('X-Content-Type-Options'));
         self::assertSame('DENY', $errRes->getHeaderLine('X-Frame-Options'));
     }
+
+    public function testRound4SsrfNonCanonicalIpv4Ipv6AllowlistSessionAntiResurrectionCsrfRateLimitAndCryptoHardening(): void
+    {
+        // 1. SafeHttpClient blocks non-canonical IPv4 literals (libcurl CURLOPT_RESOLVE bypass) & non-global IPv6 (SRv6, 3fff::/20)
+        $ssrfClient = new SafeHttpClient(dnsResolver: static fn(): array => ['93.184.216.34']);
+        foreach (['https://127.1/', 'https://0177.0.0.1/', 'https://0x7f000001/', 'https://2130706433/', 'https://127.0.0.01/'] as $shorthand) {
+            try {
+                $ssrfClient->request('GET', $shorthand);
+                self::fail('Expected non-canonical IPv4 SSRF block for ' . $shorthand);
+            } catch (SecurityException $e) {
+                self::assertStringContainsString('SSRF blocked', $e->getMessage());
+            }
+        }
+        foreach (['5f00::1', 'fe00::1', '2001:2::1', '3fff::1'] as $badV6) {
+            $v6Client = new SafeHttpClient(dnsResolver: static fn(): array => [$badV6]);
+            try {
+                $v6Client->request('GET', 'https://v6.example.com/');
+                self::fail('Expected non-global IPv6 block for ' . $badV6);
+            } catch (SecurityException $e) {
+                self::assertStringContainsString('SSRF blocked', $e->getMessage());
+            }
+        }
+
+        // 2. CacheSessionStore & SessionMiddleware prevent concurrent resurrection of destroyed sessions
+        $sessCache = new MemoryCache();
+        $store = new \Kongono\Http\Session\CacheSessionStore($sessCache);
+        $sid = bin2hex(random_bytes(24));
+        $store->write($sid, ['user_id' => 42], 3600);
+        $store->destroy($sid);
+        // Concurrent request finishing late tries to write back the destroyed session ID -> must NOT resurrect
+        $store->write($sid, ['user_id' => 42], 3600);
+        self::assertNull($store->read($sid));
+
+        // 3. CsrfMiddleware refuses %2f parser differential against root dynamic routes
+        $signer = new TokenSigner('csrf-r4-secret-key-at-least-32-bytes!!');
+        $csrfApp = App::create(__DIR__)
+            ->middleware(new CsrfMiddleware($signer, exemptPrefixes: ['/api/']))
+            ->routes(static function (Router $r): void {
+                $r->post('/{slug}', static fn(string $slug): Response => Response::text('handled:' . $slug));
+            });
+        self::assertSame(403, $csrfApp->handle(Request::create('POST', '/api%2fprofile'))->getStatusCode());
+
+        // 4. RateLimitMiddleware uses _route_pattern (no /users/01/reset bypass) & per-IP globally (no 404 cache eviction)
+        $rlCache = new MemoryCache(maxEntries: 50);
+        $rlApp = App::create(__DIR__)
+            ->instance(RateLimitMiddleware::class, new RateLimitMiddleware($rlCache, maxRequests: 1, windowSeconds: 60))
+            ->routes(static function (Router $r): void {
+                $r->post('/users/{id}/reset', static fn(int $id): Response => Response::text('reset:' . $id))
+                    ->middlewareAttributes(new Middleware(RateLimitMiddleware::class));
+            });
+        self::assertSame(200, $rlApp->handle(Request::create('POST', '/users/1/reset', serverParams: ['REMOTE_ADDR' => '198.51.100.77']))->getStatusCode());
+        self::assertSame(429, $rlApp->handle(Request::create('POST', '/users/01/reset', serverParams: ['REMOTE_ADDR' => '198.51.100.77']))->getStatusCode());
+
+        // 5. #[VerifyWebhook] automatically enables replay deduplication when CacheInterface is bound
+        $whSigner = new WebhookSigner('wh-r4-secret-key-at-least-32-bytes!!');
+        $whApp = App::create(__DIR__)
+            ->instance(WebhookSigner::class, $whSigner)
+            ->instance(\Kongono\Core\Cache\CacheInterface::class, new MemoryCache())
+            ->controller(GuardedReportsController::class);
+        $whPayload = '{"id":"evt_r4_1"}';
+        $whSig = $whSigner->sign($whPayload);
+        self::assertSame(200, $whApp->handle(Request::create('POST', '/webhooks/billing', ['X-Kongono-Signature' => $whSig], $whPayload))->getStatusCode());
+        self::assertSame(409, $whApp->handle(Request::create('POST', '/webhooks/billing', ['X-Kongono-Signature' => $whSig], $whPayload))->getStatusCode());
+
+        // 6. SignedUrl handles numeric query keys without TypeError, enforces HKDF domain separation, and rejects //host
+        $sharedKey = 'shared-app-key-for-domain-sep-test-32b!';
+        $su = new SignedUrl($sharedKey);
+        $ws = new WebhookSigner($sharedKey);
+        self::assertFalse($su->verify('/download?0=foo&signature=' . str_repeat('a', 64)));
+        $whCrossSig = $ws->sign('payload', 1000);
+        $v1Sig = substr($whCrossSig, (strpos($whCrossSig, 'v1=') ?: 0) + 3);
+        self::assertFalse($su->verify("1000.payload?signature={$v1Sig}"));
+        try {
+            $su->sign('//evil.com/download');
+            self::fail('Expected scheme-relative SignedUrl target to be rejected.');
+        } catch (SecurityException) {
+            self::addToAssertionCount(1);
+        }
+
+        // 7. Totp rejects replay across unnormalized secret casing/padding and validates constructor params
+        $totp = new Totp();
+        $replayCache = new MemoryCache();
+        $rawSec = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+        $code = $totp->code($rawSec, 1_700_000_000);
+        self::assertTrue($totp->verify($rawSec, $code, timestamp: 1_700_000_000, replayCache: $replayCache));
+        self::assertFalse($totp->verify(strtolower($rawSec) . '====', $code, timestamp: 1_700_000_000, replayCache: $replayCache));
+        try {
+            new Totp(digits: 0, period: 0, algorithm: 'md5');
+            self::fail('Expected invalid TOTP constructor parameters to fail.');
+        } catch (SecurityException) {
+            self::addToAssertionCount(1);
+        }
+
+        // 8. PkceOAuthClient fails closed on GitHub HTTP 200 error payloads and empty access tokens
+        $gh = PkceOAuthClient::github('cid', 'csec', transportOverride: static fn(): array => [
+            'status' => 200,
+            'body' => '{"error":"bad_verification_code","error_description":"The code passed is incorrect."}',
+        ]);
+        try {
+            $gh->exchangeCode('bad', 'https://app.example.com/cb', 'verifier');
+            self::fail('Expected HTTP 200 OAuth error payload to throw SecurityException.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('bad_verification_code', $e->getMessage());
+        }
+
+        // 9. PasswordHasher blocks bcrypt >72-byte silent truncation and NUL bytes
+        $bcrypt = new PasswordHasher(PASSWORD_BCRYPT);
+        try {
+            $bcrypt->hash(str_repeat('A', 73));
+            self::fail('Expected bcrypt >72-byte password to be rejected.');
+        } catch (SecurityException) {
+            self::addToAssertionCount(1);
+        }
+
+        // 10. AiThreatShieldMiddleware catches JSON honeypot field & trailing-slash traps; CorsMiddleware blocks null+credentials & sets Vary
+        $shield = new AiThreatShieldMiddleware(new MemoryCache(), honeypotPaths: ['/admin/'], maxProbesPerWindow: 0);
+        $shieldApp = App::create(__DIR__)
+            ->middleware($shield)
+            ->routes(static function (Router $r): void {
+                $r->post('/submit', static fn(): Response => Response::text('ok'));
+            });
+        self::assertSame(403, $shieldApp->handle(Request::create('GET', '/admin', serverParams: ['REMOTE_ADDR' => '198.51.100.1']))->getStatusCode());
+        self::assertSame(403, $shieldApp->handle(Request::create('POST', '/submit', ['Content-Type' => 'application/json'], '{"_hp_website":"http://bot.test"}', serverParams: ['REMOTE_ADDR' => '198.51.100.2']))->getStatusCode());
+        // maxProbesPerWindow: 0 disables burst ban instead of banning on first 404
+        self::assertSame(404, $shieldApp->handle(Request::create('GET', '/missing', serverParams: ['REMOTE_ADDR' => '198.51.100.3']))->getStatusCode());
+        self::assertFalse($shield->isBanned('198.51.100.3'));
+
+        try {
+            new CorsMiddleware(allowedOrigins: ['null'], allowCredentials: true);
+            self::fail('Expected null origin + credentials CORS misconfiguration to fail.');
+        } catch (SecurityException) {
+            self::addToAssertionCount(1);
+        }
+
+        // 11. Encryptor rejects non-canonical padded base64url payloads
+        $enc = new Encryptor('encryptor-r4-secret-key-at-least-32b!');
+        $ct = $enc->encrypt('secret');
+        try {
+            $enc->decrypt($ct . '=');
+            self::fail('Expected non-canonical padded ciphertext to fail.');
+        } catch (SecurityException) {
+            self::addToAssertionCount(1);
+        }
+    }
 }
 
 final readonly class GuardedReportsController

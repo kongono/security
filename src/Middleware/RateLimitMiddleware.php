@@ -82,25 +82,13 @@ final readonly class RateLimitMiddleware implements MiddlewareInterface
         $server = $request->getServerParams();
         $ip = is_string($server['REMOTE_ADDR'] ?? null) ? $server['REMOTE_ADDR'] : 'local';
 
-        return $ip . ':' . self::canonicalizePath($request->getUri()->getPath());
-    }
-
-    private static function canonicalizePath(string $rawPath): string
-    {
-        $decoded = str_replace(["\0", '\\'], ['', '/'], rawurldecode($rawPath));
-        $collapsed = (string) preg_replace('#/+#', '/', '/' . ltrim($decoded, '/'));
-        $segments = [];
-        foreach (explode('/', $collapsed) as $seg) {
-            if ('' === $seg || '.' === $seg) {
-                continue;
-            }
-            if ('..' === $seg) {
-                array_pop($segments);
-                continue;
-            }
-            $segments[] = $seg;
+        // Scope by declared route template when available (finite cardinality, immune to /users/01/ vs /users/1/
+        // dynamic param fragmentation and 404 cache/inode bombing); fall back to per-IP globally.
+        $routePattern = $request->getAttribute('_route_pattern');
+        if (is_string($routePattern) && '' !== $routePattern) {
+            return $ip . ':' . $routePattern;
         }
 
-        return '/' . implode('/', $segments);
+        return $ip;
     }
 }

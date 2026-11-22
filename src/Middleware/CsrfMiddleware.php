@@ -38,12 +38,17 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
         }
 
         $rawPath = $request->getUri()->getPath();
-        $decodedPath = rawurldecode($rawPath);
-        // Never allow path traversal / backslash smuggling to match an exempt prefix
-        if (!str_contains($rawPath, '..') && !str_contains($decodedPath, '..') && !str_contains($rawPath, '\\') && !str_contains($decodedPath, '\\')) {
-            $normalizedPath = (string) preg_replace('#/+#', '/', '/' . ltrim($decodedPath, '/'));
+        // Match exemptPrefixes strictly against the non-decoded Router-canonical path and refuse any traversal,
+        // backslash, NUL, or percent-encoded path delimiter/dot (%2e/%2f/%5c/%25/%00) to prevent parser differentials
+        if (
+            !str_contains($rawPath, '..')
+            && !str_contains($rawPath, '\\')
+            && !str_contains($rawPath, "\0")
+            && 1 !== preg_match('/%(?:2e|2f|5c|25|00)/i', $rawPath)
+        ) {
+            $normalizedPath = (string) preg_replace('#/+#', '/', '/' . ltrim($rawPath, '/'));
             foreach ($this->exemptPrefixes as $prefix) {
-                if (str_starts_with($normalizedPath, $prefix)) {
+                if ('' !== $prefix && str_starts_with($normalizedPath, $prefix)) {
                     return $handler->handle($request);
                 }
             }

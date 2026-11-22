@@ -17,15 +17,29 @@ final readonly class Totp
 {
     private const string BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
+    private string $algorithm;
+
     /**
-     * @param positive-int $digits Number of digits (standard: 6)
-     * @param positive-int $period Time step in seconds (standard: 30)
+     * @param int $digits Number of digits (6-8, standard: 6)
+     * @param int $period Time step in seconds (standard: 30)
      */
     public function __construct(
         private int $digits = 6,
         private int $period = 30,
-        private string $algorithm = 'sha1',
-    ) {}
+        string $algorithm = 'sha1',
+    ) {
+        if ($digits < 6 || $digits > 8) {
+            throw new SecurityException('TOTP digits must be between 6 and 8.');
+        }
+        if ($period < 1) {
+            throw new SecurityException('TOTP period must be at least 1 second.');
+        }
+        $normalizedAlg = strtolower(trim($algorithm));
+        if (!in_array($normalizedAlg, ['sha1', 'sha256', 'sha512'], true)) {
+            throw new SecurityException(sprintf('Unsupported TOTP HMAC algorithm "%s". Allowed: sha1, sha256, sha512.', $algorithm));
+        }
+        $this->algorithm = $normalizedAlg;
+    }
 
     /** Generate a cryptographically random RFC 4648 Base32 secret (default 160 bits). */
     public static function generateSecret(int $byteLength = 20): string
@@ -94,13 +108,14 @@ final readonly class Totp
             return null;
         }
 
+        $key = self::base32Decode($base32Secret);
         $counter = intdiv($timestamp ?? time(), $this->period);
         $drift = max(0, $window);
         $matchedStep = null;
 
         for ($offset = -$drift; $offset <= $drift; ++$offset) {
             $step = $counter + $offset;
-            $expected = $this->hotp($base32Secret, $step);
+            $expected = $this->hotpFromRawKey($key, $step);
             if (hash_equals($expected, $normalized)) {
                 $matchedStep = $step;
             }
@@ -114,7 +129,7 @@ final readonly class Totp
         }
 
         if (null !== $replayCache) {
-            $replayKey = 'kongono:totp:used:' . hash('sha256', $base32Secret . ':' . $matchedStep);
+            $replayKey = 'kongono:totp:used:' . hash('sha256', $key . ':' . $this->algorithm . ':' . $this->digits . ':' . $this->period . ':' . $matchedStep);
             $ttl = (2 * $drift + 2) * $this->period;
             if ($replayCache instanceof AtomicCacheInterface) {
                 if (!$replayCache->add($replayKey, true, $ttl)) {
@@ -148,7 +163,11 @@ final readonly class Totp
 
     private function hotp(#[SensitiveParameter] string $base32Secret, int $counter): string
     {
-        $key = self::base32Decode($base32Secret);
+        return $this->hotpFromRawKey(self::base32Decode($base32Secret), $counter);
+    }
+
+    private function hotpFromRawKey(#[SensitiveParameter] string $key, int $counter): string
+    {
         $binaryCounter = pack('N2', ($counter >> 32) & 0xFFFFFFFF, $counter & 0xFFFFFFFF);
         $hash = hash_hmac($this->algorithm, $binaryCounter, $key, true);
         $offset = ord($hash[strlen($hash) - 1]) & 0x0F;

@@ -93,7 +93,7 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
         try {
             $response = $handler->handle($request);
         } catch (HttpException $e) {
-            if (401 === $e->statusCode || 404 === $e->statusCode || 405 === $e->statusCode) {
+            if ($this->maxProbesPerWindow > 0 && (401 === $e->statusCode || 404 === $e->statusCode || 405 === $e->statusCode)) {
                 $probes = $this->incrementProbes($clientId);
                 if ($probes >= $this->maxProbesPerWindow) {
                     $this->ban($clientId, 'recon_burst');
@@ -103,7 +103,7 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
         }
 
         $status = $response->getStatusCode();
-        if (401 === $status || 404 === $status || 405 === $status) {
+        if ($this->maxProbesPerWindow > 0 && (401 === $status || 404 === $status || 405 === $status)) {
             $probes = $this->incrementProbes($clientId);
             if ($probes >= $this->maxProbesPerWindow) {
                 $this->ban($clientId, 'recon_burst');
@@ -159,8 +159,11 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
     private function matchesHoneypotPath(string $normalizedPath): bool
     {
         foreach ($this->honeypotPaths as $trap) {
-            $lowerTrap = strtolower($trap);
-            if ($normalizedPath === $lowerTrap || str_starts_with($normalizedPath, $lowerTrap . '/')) {
+            $canonicalTrap = $this->canonicalizePath($trap);
+            if ('/' === $canonicalTrap) {
+                continue;
+            }
+            if ($normalizedPath === $canonicalTrap || str_starts_with($normalizedPath, $canonicalTrap . '/')) {
                 return true;
             }
         }
@@ -219,6 +222,26 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
             $value = $parsed[$field];
 
             return is_string($value) ? '' !== trim($value) : null !== $value && false !== $value;
+        }
+
+        // Also inspect JSON payloads so bot JSON POSTs cannot bypass the honeypot field check
+        if (str_contains(strtolower($request->getHeaderLine('Content-Type')), 'application/json')) {
+            $stream = $request->getBody();
+            $size = $stream->getSize();
+            if (null === $size || $size <= 1_048_576) {
+                $raw = (string) $stream;
+                if ($stream->isSeekable()) {
+                    $stream->rewind();
+                }
+                if ('' !== $raw && strlen($raw) <= 1_048_576) {
+                    $decoded = json_decode($raw, true);
+                    if (is_array($decoded) && array_key_exists($field, $decoded)) {
+                        $value = $decoded[$field];
+
+                        return is_string($value) ? '' !== trim($value) : null !== $value && false !== $value;
+                    }
+                }
+            }
         }
 
         return false;

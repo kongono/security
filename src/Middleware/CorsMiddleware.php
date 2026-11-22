@@ -26,8 +26,13 @@ final readonly class CorsMiddleware implements MiddlewareInterface
         private bool $allowCredentials = false,
         private int $maxAgeSeconds = 600,
     ) {
-        if ($allowCredentials && in_array('*', $allowedOrigins, true)) {
-            throw new SecurityException('CORS misconfiguration rejected: allowCredentials cannot be combined with wildcard origin "*".');
+        if ($allowCredentials) {
+            foreach ($allowedOrigins as $origin) {
+                $trimmed = strtolower(trim($origin));
+                if ('*' === $trimmed || 'null' === $trimmed) {
+                    throw new SecurityException(sprintf('CORS misconfiguration rejected: allowCredentials cannot be combined with origin "%s".', $origin));
+                }
+            }
         }
     }
 
@@ -35,11 +40,14 @@ final readonly class CorsMiddleware implements MiddlewareInterface
     {
         $origin = $request->getHeaderLine('Origin');
         $admittedOrigin = $this->matchOrigin($origin);
+        $shouldVaryOrigin = [] !== $this->allowedOrigins && !in_array('*', $this->allowedOrigins, true);
 
         if ('OPTIONS' === strtoupper($request->getMethod()) && '' !== $origin) {
             $preflight = Response::noContent();
             if (null === $admittedOrigin) {
-                return $preflight->withStatus(403);
+                $denied = $preflight->withStatus(403);
+
+                return $shouldVaryOrigin ? $denied->withAddedHeader('Vary', 'Origin') : $denied;
             }
 
             return $this->applyCorsHeaders($preflight, $admittedOrigin)
@@ -50,7 +58,9 @@ final readonly class CorsMiddleware implements MiddlewareInterface
 
         $response = $handler->handle($request);
         if (null === $admittedOrigin) {
-            return $response;
+            return $shouldVaryOrigin && !str_contains(strtolower($response->getHeaderLine('Vary')), 'origin')
+                ? $response->withAddedHeader('Vary', 'Origin')
+                : $response;
         }
 
         return $this->applyCorsHeaders($response, $admittedOrigin);

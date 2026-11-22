@@ -26,21 +26,39 @@ final readonly class PasswordHasher
         if (strlen($plainPassword) > self::MAX_PASSWORD_BYTES) {
             throw new SecurityException(sprintf('Password exceeds maximum length of %d bytes.', self::MAX_PASSWORD_BYTES));
         }
+        if ($this->usesBcrypt()) {
+            if (strlen($plainPassword) > 72) {
+                throw new SecurityException('Bcrypt passwords cannot exceed 72 bytes (would silently truncate).');
+            }
+            if (str_contains($plainPassword, "\0")) {
+                throw new SecurityException('Bcrypt passwords cannot contain NUL bytes.');
+            }
+        }
 
         return password_hash($plainPassword, $this->algorithm);
     }
 
-    public function verify(#[SensitiveParameter] string $plainPassword, string $hash): bool
+    public function verify(#[SensitiveParameter] string $plainPassword, #[SensitiveParameter] string $hash): bool
     {
         if ('' === $plainPassword || '' === $hash || strlen($plainPassword) > self::MAX_PASSWORD_BYTES) {
+            return false;
+        }
+        if ((str_starts_with($hash, '$2y$') || str_starts_with($hash, '$2a$') || str_starts_with($hash, '$2b$'))
+            && (strlen($plainPassword) > 72 || str_contains($plainPassword, "\0"))
+        ) {
             return false;
         }
 
         return password_verify($plainPassword, $hash);
     }
 
-    public function needsRehash(string $hash): bool
+    public function needsRehash(#[SensitiveParameter] string $hash): bool
     {
         return password_needs_rehash($hash, $this->algorithm);
+    }
+
+    private function usesBcrypt(): bool
+    {
+        return PASSWORD_BCRYPT === $this->algorithm;
     }
 }
