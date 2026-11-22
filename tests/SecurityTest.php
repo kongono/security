@@ -561,6 +561,18 @@ final class SecurityTest extends TestCase
             self::assertStringContainsString('allowCredentials', $e->getMessage());
         }
 
+        // 5b. PasswordHasher & TokenSigner reject oversized DoS payloads
+        $hasher = new PasswordHasher();
+        $hugePassword = str_repeat('a', PasswordHasher::MAX_PASSWORD_BYTES + 1);
+        try {
+            $hasher->hash($hugePassword);
+            self::fail('Expected oversized password hash to fail closed.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('exceeds maximum length', $e->getMessage());
+        }
+        self::assertFalse($hasher->verify($hugePassword, '$argon2id$v=19$m=65536,t=4,p=1$fake$fake'));
+        self::assertNull($signer->verify(str_repeat('A', TokenSigner::MAX_TOKEN_BYTES + 10)));
+
         // 6. PasskeyVerifier rejects crossOrigin: true assertions by default
         $cache = new MemoryCache();
         $passkeys = new PasskeyVerifier($cache);

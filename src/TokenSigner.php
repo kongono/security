@@ -10,6 +10,8 @@ use SensitiveParameter;
 /** Constant-time HMAC-SHA256 stateless signed token & CSRF token generator/verifier. */
 final readonly class TokenSigner
 {
+    public const int MAX_TOKEN_BYTES = 16_384;
+
     public function __construct(
         #[SensitiveParameter]
         private string $secretKey,
@@ -45,6 +47,9 @@ final readonly class TokenSigner
      */
     public function verify(#[SensitiveParameter] string $token, ?int $now = null): ?array
     {
+        if ('' === $token || strlen($token) > self::MAX_TOKEN_BYTES) {
+            return null;
+        }
         $parts = explode('.', $token);
         if (2 !== count($parts)) {
             return null;
