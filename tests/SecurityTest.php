@@ -18,6 +18,7 @@ use Kongono\Security\Attributes\VerifyWebhook;
 use Kongono\Security\Egress\SafeHttpClient;
 use Kongono\Security\Encryptor;
 use Kongono\Security\Gate;
+use Kongono\Security\Middleware\AiThreatShieldMiddleware;
 use Kongono\Security\Middleware\BearerAuthMiddleware;
 use Kongono\Security\Middleware\CorsMiddleware;
 use Kongono\Security\Middleware\CsrfMiddleware;
@@ -293,6 +294,82 @@ final class SecurityTest extends TestCase
         $recovery = Totp::generateRecoveryCodes(4);
         self::assertCount(4, $recovery);
         self::assertMatchesRegularExpression('/\A[0-9A-F]{4}-[0-9A-F]{4}\z/', $recovery[0]);
+    }
+
+    public function testAiThreatShieldBlocksHoneypotsReconBurstsAndComputeBudgets(): void
+    {
+        $cache = new MemoryCache();
+        $shield = new AiThreatShieldMiddleware(
+            cache: $cache,
+            banSeconds: 600,
+            maxProbesPerWindow: 2,
+            maxCostUnitsPerWindow: 100,
+        );
+
+        $app = App::create(__DIR__)->middleware($shield);
+        $app->router()->get('/ok', static fn(): Response => Response::json(['ok' => true]));
+        $app->router()->post('/signup', static fn(): Response => Response::json(['ok' => true]));
+
+        // Normal traffic succeeds with active shield header
+        $goodReq = Request::create('GET', '/ok', serverParams: ['REMOTE_ADDR' => '198.51.100.10']);
+        $goodRes = $app->handle($goodReq);
+        self::assertSame(200, $goodRes->getStatusCode());
+        self::assertSame('active', $goodRes->getHeaderLine('X-Kongono-Shield'));
+
+        // Autonomous recon bot probing /.env gets banned immediately
+        $botEnv = Request::create('GET', '/.env', serverParams: ['REMOTE_ADDR' => '198.51.100.20']);
+        $trapRes = $app->handle($botEnv);
+        self::assertSame(403, $trapRes->getStatusCode());
+        self::assertSame('honeypot-triggered', $trapRes->getHeaderLine('X-Kongono-Shield'));
+        self::assertTrue($shield->isBanned('198.51.100.20'));
+
+        // Subsequent request to a real endpoint from the banned IP fails closed 403
+        $followUp = $app->handle(Request::create('GET', '/ok', serverParams: ['REMOTE_ADDR' => '198.51.100.20']));
+        self::assertSame(403, $followUp->getStatusCode());
+        self::assertSame('blocked', $followUp->getHeaderLine('X-Kongono-Shield'));
+
+        // Hidden honeypot form field catches blind form-filling bot
+        $formBot = Request::create('POST', '/signup', parsedBody: [
+            'email' => 'bot@spam.example',
+            '_hp_website' => 'https://spam.example',
+        ], serverParams: ['REMOTE_ADDR' => '198.51.100.30']);
+        $formRes = $app->handle($formBot);
+        self::assertSame(403, $formRes->getStatusCode());
+        self::assertSame('honeypot-field', $formRes->getHeaderLine('X-Kongono-Shield'));
+
+        // 404 recon burst auto-bans after threshold
+        $scannerIp = '198.51.100.40';
+        self::assertSame(404, $app->handle(Request::create('GET', '/nope-1', serverParams: ['REMOTE_ADDR' => $scannerIp]))->getStatusCode());
+        self::assertFalse($shield->isBanned($scannerIp));
+        self::assertSame(404, $app->handle(Request::create('GET', '/nope-2', serverParams: ['REMOTE_ADDR' => $scannerIp]))->getStatusCode());
+        self::assertTrue($shield->isBanned($scannerIp));
+        $shield->unban($scannerIp);
+        self::assertFalse($shield->isBanned($scannerIp));
+
+        // Cost-aware compute budget guard fails closed with 429
+        $budgetIp = '198.51.100.50';
+        self::assertSame(100, $shield->recordCostUnits($budgetIp, 100));
+        $budgetRes = $app->handle(Request::create('GET', '/ok', serverParams: ['REMOTE_ADDR' => $budgetIp]));
+        self::assertSame(429, $budgetRes->getStatusCode());
+        self::assertSame('budget-exceeded', $budgetRes->getHeaderLine('X-Kongono-Shield'));
+    }
+
+    public function testSafeHttpClientRequestManyEnforcesSsrfFailClosedUpfront(): void
+    {
+        $client = new SafeHttpClient(dnsResolver: static fn(string $host): array => match ($host) {
+            'api.example.com' => ['93.184.216.34'],
+            'internal.local' => ['10.0.0.5'],
+            default => ['127.0.0.1'],
+        });
+
+        self::assertSame([], $client->requestMany([]));
+
+        $this->expectException(SecurityException::class);
+        $this->expectExceptionMessage('SSRF blocked');
+        $client->requestMany([
+            'safe' => ['url' => 'https://api.example.com/v1/status'],
+            'ssrf' => ['url' => 'https://internal.local/admin'],
+        ]);
     }
 }
 

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Kongono\Security\Egress;
 
 use Closure;
+use CurlHandle;
+use Fiber;
 use Kongono\Security\SecurityException;
 
 /**
@@ -149,6 +151,128 @@ final readonly class SafeHttpClient
         }
 
         return ['status' => $status, 'body' => $collected];
+    }
+
+    /**
+     * Execute multiple SSRF-safe HTTP requests concurrently via curl_multi,
+     * pre-validating EVERY target URL and pinning every resolved IP before opening sockets.
+     * Cooperatively yields if invoked inside a PHP Fiber.
+     *
+     * @template TKey of array-key
+     * @param array<TKey, array{method?: string, url: string, headers?: array<string, string>, body?: ?string, timeout?: int}> $requests
+     * @return array<TKey, array{status: int, body: string}>
+     */
+    public function requestMany(array $requests): array
+    {
+        if ([] === $requests) {
+            return [];
+        }
+
+        // Fail closed upfront: admit every target URL & IP BEFORE launching any transfer
+        /** @var array<TKey, array{method: non-empty-string, url: string, headers: array<string, string>, body: ?string, timeout: int, target: array{scheme: string, host: string, port: int, ip: string}}> $prepared */
+        $prepared = [];
+        foreach ($requests as $key => $req) {
+            $upperMethod = strtoupper(trim($req['method'] ?? 'GET'));
+            if ('' === $upperMethod) {
+                throw new SecurityException('Outbound HTTP method cannot be empty.');
+            }
+            $prepared[$key] = [
+                'method' => $upperMethod,
+                'url' => $req['url'],
+                'headers' => $req['headers'] ?? [],
+                'body' => $req['body'] ?? null,
+                'timeout' => $req['timeout'] ?? 15,
+                'target' => $this->admitTarget($req['url']),
+            ];
+        }
+
+        $multi = curl_multi_init();
+        /** @var array<TKey, CurlHandle> $handles */
+        $handles = [];
+        /** @var array<TKey, string> $buffers */
+        $buffers = [];
+        /** @var array<TKey, bool> $overflows */
+        $overflows = [];
+        $maxBytes = $this->maxResponseBytes;
+
+        try {
+            foreach ($prepared as $key => $item) {
+                $ch = curl_init($item['url']);
+                if (false === $ch) {
+                    throw new SecurityException('Unable to initialize cURL handle.');
+                }
+
+                $headerLines = [];
+                foreach ($item['headers'] as $name => $value) {
+                    $headerLines[] = $name . ': ' . $value;
+                }
+
+                $pinIp = str_contains($item['target']['ip'], ':') ? '[' . $item['target']['ip'] . ']' : $item['target']['ip'];
+                $buffers[$key] = '';
+                $overflows[$key] = false;
+
+                curl_setopt_array($ch, [
+                    CURLOPT_CUSTOMREQUEST => $item['method'],
+                    CURLOPT_HTTPHEADER => $headerLines,
+                    CURLOPT_RESOLVE => [sprintf('%s:%d:%s', $item['target']['host'], $item['target']['port'], $pinIp)],
+                    CURLOPT_FOLLOWLOCATION => false,
+                    CURLOPT_PROXY => '',
+                    CURLOPT_SSL_VERIFYPEER => true,
+                    CURLOPT_SSL_VERIFYHOST => 2,
+                    CURLOPT_CONNECTTIMEOUT => min(10, max(1, $item['timeout'])),
+                    CURLOPT_TIMEOUT => max(1, $item['timeout']),
+                    CURLOPT_WRITEFUNCTION => static function (mixed $_ch, string $chunk) use (&$buffers, &$overflows, $key, $maxBytes): int {
+                        if (strlen($buffers[$key]) + strlen($chunk) > $maxBytes) {
+                            $overflows[$key] = true;
+
+                            return 0;
+                        }
+                        $buffers[$key] .= $chunk;
+
+                        return strlen($chunk);
+                    },
+                ]);
+
+                if (null !== $item['body']) {
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $item['body']);
+                }
+
+                $handles[$key] = $ch;
+                curl_multi_add_handle($multi, $ch);
+            }
+
+            do {
+                $status = curl_multi_exec($multi, $active);
+                if (null !== Fiber::getCurrent()) {
+                    Fiber::suspend();
+                } elseif ($active > 0 && CURLM_OK === $status) {
+                    curl_multi_select($multi, 0.05);
+                }
+            } while ($active > 0 && (CURLM_OK === $status || CURLM_CALL_MULTI_PERFORM === $status));
+
+            /** @var array<TKey, array{status: int, body: string}> $results */
+            $results = [];
+            foreach ($handles as $key => $ch) {
+                if ($overflows[$key]) {
+                    throw new SecurityException(sprintf('Outbound response exceeded maximum bound of %d bytes.', $this->maxResponseBytes));
+                }
+                $error = curl_error($ch);
+                if ('' !== $error) {
+                    throw new SecurityException('Outbound HTTP transfer failed: ' . $error);
+                }
+                $results[$key] = [
+                    'status' => curl_getinfo($ch, CURLINFO_RESPONSE_CODE),
+                    'body' => $buffers[$key],
+                ];
+            }
+
+            return $results;
+        } finally {
+            foreach ($handles as $ch) {
+                curl_multi_remove_handle($multi, $ch);
+            }
+            curl_multi_close($multi);
+        }
     }
 
     public function isIpAdmitted(string $ip): bool
