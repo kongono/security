@@ -36,10 +36,15 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
             return $handler->handle($request);
         }
 
-        $path = $request->getUri()->getPath();
-        foreach ($this->exemptPrefixes as $prefix) {
-            if (str_starts_with($path, $prefix)) {
-                return $handler->handle($request);
+        $rawPath = $request->getUri()->getPath();
+        $decodedPath = rawurldecode($rawPath);
+        // Never allow path traversal / backslash smuggling to match an exempt prefix
+        if (!str_contains($rawPath, '..') && !str_contains($decodedPath, '..') && !str_contains($rawPath, '\\') && !str_contains($decodedPath, '\\')) {
+            $normalizedPath = (string) preg_replace('#/+#', '/', '/' . ltrim($decodedPath, '/'));
+            foreach ($this->exemptPrefixes as $prefix) {
+                if (str_starts_with($normalizedPath, $prefix)) {
+                    return $handler->handle($request);
+                }
             }
         }
 
@@ -50,10 +55,16 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
         }
 
         $token = trim($request->getHeaderLine($this->headerName));
-        if ('' === $token && $request instanceof Request) {
-            $raw = $request->input($this->formField);
-            if (is_string($raw)) {
-                $token = trim($raw);
+        if ('' === $token) {
+            // Only read CSRF token from POST/parsed body — NEVER from URL query parameters
+            $parsedBody = $request->getParsedBody();
+            if (is_array($parsedBody) && is_string($parsedBody[$this->formField] ?? null)) {
+                $token = trim($parsedBody[$this->formField]);
+            } elseif ($request instanceof Request && str_contains(strtolower($request->getHeaderLine('Content-Type')), 'application/json')) {
+                $json = $request->jsonBody();
+                if (is_string($json[$this->formField] ?? null)) {
+                    $token = trim($json[$this->formField]);
+                }
             }
         }
 

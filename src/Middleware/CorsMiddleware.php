@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Kongono\Security\Middleware;
 
 use Kongono\Http\Response;
+use Kongono\Security\SecurityException;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
@@ -24,7 +25,11 @@ final readonly class CorsMiddleware implements MiddlewareInterface
         private array $allowedHeaders = ['Content-Type', 'Authorization', 'X-CSRF-Token'],
         private bool $allowCredentials = false,
         private int $maxAgeSeconds = 600,
-    ) {}
+    ) {
+        if ($allowCredentials && in_array('*', $allowedOrigins, true)) {
+            throw new SecurityException('CORS misconfiguration rejected: allowCredentials cannot be combined with wildcard origin "*".');
+        }
+    }
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {

@@ -68,19 +68,14 @@ final readonly class SafeHttpClient
             throw new SecurityException(sprintf('Unable to resolve outbound host "%s".', $host));
         }
 
-        $admittedIp = null;
+        // Fail closed if ANY resolved A/AAAA record points to a private/reserved address (blocks DNS rebinding)
         foreach ($ips as $ip) {
-            if ($this->isIpAdmitted($ip)) {
-                $admittedIp = $ip;
-                break;
+            if (!$this->isIpAdmitted($ip)) {
+                throw new SecurityException(sprintf('Outbound host "%s" resolved to a private/reserved IP address (SSRF blocked).', $host));
             }
         }
 
-        if (null === $admittedIp) {
-            throw new SecurityException(sprintf('Outbound host "%s" resolved only to private/reserved IP addresses (SSRF blocked).', $host));
-        }
-
-        return ['scheme' => $scheme, 'host' => $host, 'port' => $port, 'ip' => $admittedIp];
+        return ['scheme' => $scheme, 'host' => $host, 'port' => $port, 'ip' => $ips[0]];
     }
 
     /**
@@ -103,21 +98,21 @@ final readonly class SafeHttpClient
             throw new SecurityException('Unable to initialize cURL handle.');
         }
 
-        $headerLines = [];
-        foreach ($headers as $name => $value) {
-            $headerLines[] = $name . ': ' . $value;
-        }
+        $headerLines = $this->formatHeaders($headers);
 
         $pinIp = str_contains($target['ip'], ':') ? '[' . $target['ip'] . ']' : $target['ip'];
         $collected = '';
         $overflow = false;
         $maxBytes = $this->maxResponseBytes;
+        $allowedProtos = $this->allowPlainHttp ? 'http,https' : 'https';
 
         curl_setopt_array($ch, [
             CURLOPT_CUSTOMREQUEST => $upperMethod,
             CURLOPT_HTTPHEADER => $headerLines,
             CURLOPT_RESOLVE => [sprintf('%s:%d:%s', $target['host'], $target['port'], $pinIp)],
             CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_PROTOCOLS_STR => $allowedProtos,
+            CURLOPT_REDIR_PROTOCOLS_STR => $allowedProtos,
             CURLOPT_PROXY => '',
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
@@ -202,20 +197,20 @@ final readonly class SafeHttpClient
                     throw new SecurityException('Unable to initialize cURL handle.');
                 }
 
-                $headerLines = [];
-                foreach ($item['headers'] as $name => $value) {
-                    $headerLines[] = $name . ': ' . $value;
-                }
+                $headerLines = $this->formatHeaders($item['headers']);
 
                 $pinIp = str_contains($item['target']['ip'], ':') ? '[' . $item['target']['ip'] . ']' : $item['target']['ip'];
                 $buffers[$key] = '';
                 $overflows[$key] = false;
+                $allowedProtos = $this->allowPlainHttp ? 'http,https' : 'https';
 
                 curl_setopt_array($ch, [
                     CURLOPT_CUSTOMREQUEST => $item['method'],
                     CURLOPT_HTTPHEADER => $headerLines,
                     CURLOPT_RESOLVE => [sprintf('%s:%d:%s', $item['target']['host'], $item['target']['port'], $pinIp)],
                     CURLOPT_FOLLOWLOCATION => false,
+                    CURLOPT_PROTOCOLS_STR => $allowedProtos,
+                    CURLOPT_REDIR_PROTOCOLS_STR => $allowedProtos,
                     CURLOPT_PROXY => '',
                     CURLOPT_SSL_VERIFYPEER => true,
                     CURLOPT_SSL_VERIFYHOST => 2,
@@ -284,6 +279,50 @@ final readonly class SafeHttpClient
             return true;
         }
 
+        $packed = @inet_pton($ip);
+        if (false === $packed) {
+            return false;
+        }
+
+        // Unwrap IPv4-mapped IPv6 (::ffff:a.b.c.d / ::ffff:xxxx:xxxx) and 6to4 (2002::/16) / Teredo / NAT64
+        if (16 === strlen($packed)) {
+            if (str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff")) {
+                $mappedV4 = @inet_ntop(substr($packed, 12, 4));
+
+                return is_string($mappedV4) && $this->isIpAdmitted($mappedV4);
+            }
+            // Reject ::, ::1, fc00::/7 (ULA), fe80::/10 (link-local), ff00::/8 (multicast), 100::/64, 64:ff9b::/96 (NAT64)
+            $b0 = ord($packed[0]);
+            $b1 = ord($packed[1]);
+            if (
+                $packed === str_repeat("\x00", 16)
+                || $packed === str_repeat("\x00", 15) . "\x01"
+                || 0xfc === ($b0 & 0xfe)
+                || (0xfe === $b0 && 0x80 === ($b1 & 0xc0))
+                || 0xff === $b0
+                || str_starts_with($packed, "\x00\x64\xff\x9b\x00\x00\x00\x00\x00\x00\x00\x00")
+            ) {
+                return false;
+            }
+        } elseif (4 === strlen($packed)) {
+            $o0 = ord($packed[0]);
+            $o1 = ord($packed[1]);
+            // Block 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10 (CGNAT), 127.0.0.0/8, 169.254.0.0/16 (IMDS),
+            // 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 (multicast), 240.0.0.0/4 (reserved)
+            if (
+                0 === $o0
+                || 10 === $o0
+                || (100 === $o0 && $o1 >= 64 && $o1 <= 127)
+                || 127 === $o0
+                || (169 === $o0 && 254 === $o1)
+                || (172 === $o0 && $o1 >= 16 && $o1 <= 31)
+                || (192 === $o0 && 168 === $o1)
+                || $o0 >= 224
+            ) {
+                return false;
+            }
+        }
+
         return false !== filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
     }
 
@@ -299,8 +338,40 @@ final readonly class SafeHttpClient
             return ($this->dnsResolver)($host);
         }
 
-        $records = gethostbynamel($host);
+        $ips = [];
+        $v4 = gethostbynamel($host);
+        if (is_array($v4)) {
+            array_push($ips, ...$v4);
+        }
 
-        return is_array($records) ? $records : [];
+        if (function_exists('dns_get_record')) {
+            $aaaa = @dns_get_record($host, DNS_AAAA);
+            if (is_array($aaaa)) {
+                foreach ($aaaa as $rec) {
+                    if (is_string($rec['ipv6'] ?? null)) {
+                        $ips[] = $rec['ipv6'];
+                    }
+                }
+            }
+        }
+
+        return array_values(array_unique($ips));
+    }
+
+    /**
+     * @param array<string, string> $headers
+     * @return list<string>
+     */
+    private function formatHeaders(array $headers): array
+    {
+        $lines = [];
+        foreach ($headers as $name => $value) {
+            if (1 !== preg_match('/\A[a-zA-Z0-9!#$%&\'*+.^_`|~-]+\z/', $name) || false !== strpbrk($value, "\r\n\0")) {
+                throw new SecurityException(sprintf('Unsafe outbound HTTP header "%s" rejected.', $name));
+            }
+            $lines[] = $name . ': ' . $value;
+        }
+
+        return $lines;
     }
 }

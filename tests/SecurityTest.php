@@ -489,6 +489,103 @@ final class SecurityTest extends TestCase
             self::assertStringContainsString('cloned authenticator', $e->getMessage());
         }
     }
+
+    public function testBrutalSecurityHardeningSsrfIpv6CsrfHoneypotHeadersCorsAndCrossOriginPasskey(): void
+    {
+        // 1. SafeHttpClient blocks IPv4-mapped IPv6, CGNAT, ULA, link-local, 0.0.0.0, and mixed-record DNS rebinding
+        $safeHttp = new SafeHttpClient(dnsResolver: static fn(string $host): array => match ($host) {
+            'rebind.evil.test' => ['93.184.216.34', '127.0.0.1'],
+            'v6mapped.test' => ['::ffff:169.254.169.254'],
+            default => ['93.184.216.34'],
+        });
+        self::assertFalse($safeHttp->isIpAdmitted('::ffff:127.0.0.1'));
+        self::assertFalse($safeHttp->isIpAdmitted('::ffff:169.254.169.254'));
+        self::assertFalse($safeHttp->isIpAdmitted('::ffff:10.0.0.1'));
+        self::assertFalse($safeHttp->isIpAdmitted('100.64.0.1'));
+        self::assertFalse($safeHttp->isIpAdmitted('0.0.0.0'));
+        self::assertFalse($safeHttp->isIpAdmitted('fd00::1'));
+        self::assertFalse($safeHttp->isIpAdmitted('fe80::1'));
+        self::assertTrue($safeHttp->isIpAdmitted('93.184.216.34'));
+
+        foreach (['https://rebind.evil.test/', 'https://v6mapped.test/'] as $hostileUrl) {
+            try {
+                $safeHttp->admitTarget($hostileUrl);
+                self::fail('Expected SSRF target to fail closed: ' . $hostileUrl);
+            } catch (SecurityException $e) {
+                self::assertStringContainsString('SSRF blocked', $e->getMessage());
+            }
+        }
+
+        // 2. CsrfMiddleware rejects query-string CSRF tokens and traversal bypasses of exemptPrefixes
+        $signer = new TokenSigner('csrf-hardening-secret-key-at-least-32-bytes');
+        $csrfApp = App::create(__DIR__)
+            ->middleware(new CsrfMiddleware($signer, exemptPrefixes: ['/api/']))
+            ->routes(static function (Router $r): void {
+                $r->post('/form', static fn(): Response => Response::text('ok'));
+                $r->post('/api/../form', static fn(): Response => Response::text('bypassed'));
+            });
+        $validCsrf = $signer->generateCsrfToken('sess-abc');
+        $queryTokenReq = Request::create('POST', '/form?_csrf=' . rawurlencode($validCsrf))
+            ->withCookieParams(['kongono_session' => 'sess-abc']);
+        self::assertInstanceOf(Request::class, $queryTokenReq);
+        self::assertSame(403, $csrfApp->handle($queryTokenReq)->getStatusCode());
+        self::assertSame(403, $csrfApp->handle(Request::create('POST', '/api/../form'))->getStatusCode());
+
+        // 3. AiThreatShieldMiddleware catches obfuscated honeypot paths (//.env, /./.env, /%2eenv, /.env.)
+        foreach (['//.env', '/./.env', '/%2eenv', '/.env.'] as $idx => $evasionPath) {
+            $shield = new AiThreatShieldMiddleware(new MemoryCache());
+            $shieldApp = App::create(__DIR__)->middleware($shield);
+            $ip = '203.0.113.' . (10 + $idx);
+            $res = $shieldApp->handle(Request::create('GET', $evasionPath, serverParams: ['REMOTE_ADDR' => $ip]));
+            self::assertSame(403, $res->getStatusCode(), 'Expected honeypot catch for ' . $evasionPath);
+            self::assertTrue($shield->isBanned($ip));
+        }
+
+        // 4. SecurityHeadersMiddleware emits hardened CSP, Permissions-Policy, and HTTPS HSTS
+        $secApp = App::create(__DIR__)
+            ->middleware(new SecurityHeadersMiddleware())
+            ->routes(static function (Router $r): void {
+                $r->get('/secure', static fn(): Response => Response::text('ok'));
+            });
+        $secRes = $secApp->handle(Request::create('GET', 'https://app.kongono.dev/secure'));
+        self::assertStringContainsString("object-src 'none'", $secRes->getHeaderLine('Content-Security-Policy'));
+        self::assertStringContainsString("base-uri 'self'", $secRes->getHeaderLine('Content-Security-Policy'));
+        self::assertStringContainsString('camera=()', $secRes->getHeaderLine('Permissions-Policy'));
+        self::assertStringContainsString('max-age=31536000', $secRes->getHeaderLine('Strict-Transport-Security'));
+
+        // 5. CorsMiddleware rejects wildcard origin + credentials misconfiguration at construction
+        try {
+            new CorsMiddleware(allowedOrigins: ['*'], allowCredentials: true);
+            self::fail('Expected wildcard CORS + credentials misconfiguration to fail closed.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('allowCredentials', $e->getMessage());
+        }
+
+        // 6. PasskeyVerifier rejects crossOrigin: true assertions by default
+        $cache = new MemoryCache();
+        $passkeys = new PasskeyVerifier($cache);
+        $ch = $passkeys->createChallenge('kongono.dev', 'https://kongono.dev', now: 3000);
+        $kp = sodium_crypto_sign_keypair();
+        $cdCross = json_encode([
+            'type' => 'webauthn.get',
+            'challenge' => $ch['challenge'],
+            'origin' => 'https://kongono.dev',
+            'crossOrigin' => true,
+        ], JSON_THROW_ON_ERROR);
+        $ad = hash('sha256', 'kongono.dev', true) . chr(0x01) . pack('N', 1);
+        $sig = sodium_crypto_sign_detached($ad . hash('sha256', $cdCross, true), sodium_crypto_sign_secretkey($kp));
+        $this->expectException(SecurityException::class);
+        $this->expectExceptionMessage('Cross-origin passkey assertions are denied');
+        $passkeys->verifyAssertion(
+            expectedChallenge: $ch['challenge'],
+            clientDataJsonBase64Url: PasskeyVerifier::base64UrlEncode($cdCross),
+            authenticatorDataBase64Url: PasskeyVerifier::base64UrlEncode($ad),
+            signatureBase64Url: PasskeyVerifier::base64UrlEncode($sig),
+            publicKey: bin2hex(sodium_crypto_sign_publickey($kp)),
+            algorithm: 'EdDSA',
+            now: 3010,
+        );
+    }
 }
 
 final readonly class GuardedReportsController

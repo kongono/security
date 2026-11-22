@@ -74,6 +74,7 @@ final readonly class PasskeyVerifier
         int $previousSignCount = 0,
         bool $requireUserVerification = false,
         ?int $now = null,
+        bool $allowCrossOrigin = false,
     ): array {
         $cacheKey = $this->challengeKey($expectedChallenge);
         $rawChallengeMeta = $this->cache->get($cacheKey);
@@ -111,6 +112,10 @@ final readonly class PasskeyVerifier
         $receivedOrigin = is_string($clientData['origin'] ?? null) ? rtrim($clientData['origin'], '/') : '';
         if (!hash_equals($meta['origin'], $receivedOrigin)) {
             throw new SecurityException('Passkey origin mismatch.');
+        }
+
+        if (!$allowCrossOrigin && true === ($clientData['crossOrigin'] ?? false)) {
+            throw new SecurityException('Cross-origin passkey assertions are denied by policy.');
         }
 
         $authData = self::base64UrlDecode($authenticatorDataBase64Url);

@@ -63,7 +63,7 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
             return $this->blockedResponse('blocked', 'Access denied by Kongono AI Threat Shield.');
         }
 
-        $normalizedPath = strtolower($request->getUri()->getPath());
+        $normalizedPath = $this->canonicalizePath($request->getUri()->getPath());
         if ($this->matchesHoneypotPath($normalizedPath)) {
             $this->ban($clientId, 'honeypot_path:' . $normalizedPath);
 
@@ -148,6 +148,25 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
         }
 
         return false;
+    }
+
+    /**
+     * Canonicalize request paths before honeypot matching to defeat evasion via
+     * `//.env`, `/./.env`, `/%2eenv`, `\.env`, or trailing dots/slashes (`/.env.`).
+     */
+    private function canonicalizePath(string $rawPath): string
+    {
+        $decoded = str_replace(["\0", '\\'], ['', '/'], rawurldecode($rawPath));
+        $collapsed = (string) preg_replace('#/+#', '/', '/' . ltrim($decoded, '/'));
+        $segments = [];
+        foreach (explode('/', $collapsed) as $seg) {
+            if ('' === $seg || '.' === $seg) {
+                continue;
+            }
+            $segments[] = rtrim($seg, '.');
+        }
+
+        return '/' . strtolower(implode('/', $segments));
     }
 
     private function hasTriggeredHoneypotField(ServerRequestInterface $request, string $field): bool
