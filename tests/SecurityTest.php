@@ -19,6 +19,7 @@ use Kongono\Security\Auth\MagicLinkAuth;
 use Kongono\Security\Auth\PasskeyVerifier;
 use Kongono\Security\Auth\PkceOAuthClient;
 use Kongono\Security\Egress\SafeHttpClient;
+use Kongono\Security\Egress\SafeHttpFake;
 use Kongono\Security\Encryptor;
 use Kongono\Security\Gate;
 use Kongono\Security\Middleware\AiThreatShieldMiddleware;
@@ -916,6 +917,77 @@ final class SecurityTest extends TestCase
             self::fail('Expected strict v2-only Encryptor to reject legacy v1 payload.');
         } catch (SecurityException) {
             self::addToAssertionCount(1);
+        }
+    }
+
+    public function testSafeHttpClientFakeResponderAssertionsAndSsrfEnforcement(): void
+    {
+        $client = SafeHttpClient::fake([
+            'POST https://api.stripe.com/v1/charges' => SafeHttpFake::json(['id' => 'ch_test_1', 'paid' => true], 201),
+            'https://api.github.com/repos/*' => static fn(string $method, string $url): array => SafeHttpFake::json([
+                'method' => $method,
+                'url' => $url,
+            ]),
+        ], allowedHosts: ['api.stripe.com', 'api.github.com'], maxResponseBytes: 4096);
+
+        $recorder = $client->fakeRecorder();
+        self::assertNotNull($recorder);
+        $recorder->assertNothingSent();
+
+        // 1. Stubbed single request + method/URL wildcard matching
+        $charge = $client->request('POST', 'https://api.stripe.com/v1/charges', ['Idempotency-Key' => 'k1'], '{"amount":500}');
+        self::assertSame(201, $charge['status']);
+        self::assertSame('{"id":"ch_test_1","paid":true}', $charge['body']);
+
+        // 2. Stubbed concurrent requestMany() preserves associative keys
+        $many = $client->requestMany([
+            'repo' => ['url' => 'https://api.github.com/repos/kongono/framework'],
+            'charge2' => ['method' => 'POST', 'url' => 'https://api.stripe.com/v1/charges', 'body' => '{"amount":900}'],
+        ]);
+        self::assertSame(200, $many['repo']['status']);
+        self::assertStringContainsString('kongono/framework', $many['repo']['body']);
+        self::assertSame(201, $many['charge2']['status']);
+
+        // 3. Recorder assertions (pattern, times, closure predicate, count)
+        $recorder
+            ->assertSentCount(3)
+            ->assertSent('POST https://api.stripe.com/v1/charges', times: 2)
+            ->assertSent('https://api.github.com/repos/*', times: 1)
+            ->assertSent(static fn(array $r): bool => 'k1' === ($r['headers']['Idempotency-Key'] ?? null), times: 1);
+
+        // 4. Stray unmatched request on allowed host fails closed
+        try {
+            $client->request('GET', 'https://api.stripe.com/v1/unknown');
+            self::fail('Expected stray outbound request to be blocked by SafeHttpFake.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('Stray outbound HTTP request blocked', $e->getMessage());
+        }
+
+        // 5. SSRF & allowlist rules STILL run even in fake mode!
+        foreach ([
+            'http://api.stripe.com/v1/charges',
+            'https://169.254.169.254/latest/meta-data/',
+            'https://localhost/admin',
+            'https://evil.example.com/steal',
+        ] as $hostileUrl) {
+            try {
+                $client->request('GET', $hostileUrl);
+                self::fail('Expected SafeHttpClient::fake() to still enforce SSRF/allowlist on ' . $hostileUrl);
+            } catch (SecurityException) {
+                self::addToAssertionCount(1);
+            }
+        }
+
+        // 6. maxResponseBytes cap is enforced even on fake responses
+        $tinyClient = SafeHttpClient::fake(
+            ['*' => SafeHttpFake::response(str_repeat('X', 200), 200)],
+            maxResponseBytes: 64,
+        );
+        try {
+            $tinyClient->request('GET', 'https://api.example.com/big');
+            self::fail('Expected oversized fake response to violate maxResponseBytes.');
+        } catch (SecurityException $e) {
+            self::assertStringContainsString('exceeded maximum bound', $e->getMessage());
         }
     }
 }

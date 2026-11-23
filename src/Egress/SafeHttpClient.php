@@ -23,6 +23,7 @@ final readonly class SafeHttpClient
     /**
      * @param list<string>                                $allowedHosts Optional exact hostname allowlist
      * @param (Closure(string): list<string>)|null        $dnsResolver  Optional custom DNS resolver for testing
+     * @param ?SafeHttpFake                               $fake         Optional in-memory fake responder (still enforces full SSRF validation)
      */
     public function __construct(
         private array $allowedHosts = [],
@@ -30,7 +31,51 @@ final readonly class SafeHttpClient
         private bool $allowPrivateIps = false,
         private int $maxResponseBytes = 2_097_152,
         private ?Closure $dnsResolver = null,
+        private ?SafeHttpFake $fake = null,
     ) {}
+
+    /**
+     * Construct a test-ready SafeHttpClient backed by a {@see SafeHttpFake} responder.
+     * Enforces full SSRF admission (blocking http://, private/loopback/IMDS IPs, header injection,
+     * and allowlist violations) while avoiding live network/DNS I/O.
+     *
+     * @param SafeHttpFake|array<string, array{status: int, body: string}|Closure(string, string, array<string, string>, ?string): array{status: int, body: string}>|Closure(string, string, array<string, string>, ?string): array{status: int, body: string} $stubs
+     * @param list<string>                                $allowedHosts
+     * @param (Closure(string): list<string>)|null        $dnsResolver
+     */
+    public static function fake(
+        SafeHttpFake|array|Closure $stubs = [],
+        array $allowedHosts = [],
+        bool $allowPlainHttp = false,
+        bool $allowPrivateIps = false,
+        int $maxResponseBytes = 2_097_152,
+        ?Closure $dnsResolver = null,
+        bool $preventStrayRequests = true,
+    ): self {
+        $recorder = $stubs instanceof SafeHttpFake ? $stubs : new SafeHttpFake($stubs, $preventStrayRequests);
+        $resolver = $dnsResolver ?? static function (string $host): array {
+            $lower = strtolower($host);
+            if ('localhost' === $lower || str_ends_with($lower, '.localhost') || str_ends_with($lower, '.local')) {
+                return ['127.0.0.1'];
+            }
+
+            return ['93.184.216.34'];
+        };
+
+        return new self(
+            allowedHosts: $allowedHosts,
+            allowPlainHttp: $allowPlainHttp,
+            allowPrivateIps: $allowPrivateIps,
+            maxResponseBytes: $maxResponseBytes,
+            dnsResolver: $resolver,
+            fake: $recorder,
+        );
+    }
+
+    public function fakeRecorder(): ?SafeHttpFake
+    {
+        return $this->fake;
+    }
 
     /**
      * Validate a target URL, normalize its host (ASCII / punycode), reconstruct a canonical URL,
@@ -95,13 +140,21 @@ final readonly class SafeHttpClient
     {
         $upperMethod = $this->normalizeMethod($method);
         $target = $this->admitTarget($url);
+        $headerLines = $this->formatHeaders($headers);
+
+        if (null !== $this->fake) {
+            $result = $this->fake->respond($upperMethod, $target['url'], $headers, $body);
+            if (strlen($result['body']) > $this->maxResponseBytes) {
+                throw new SecurityException(sprintf('Outbound response exceeded maximum bound of %d bytes.', $this->maxResponseBytes));
+            }
+
+            return $result;
+        }
 
         $ch = curl_init($target['url']);
         if (false === $ch) {
             throw new SecurityException('Unable to initialize cURL handle.');
         }
-
-        $headerLines = $this->formatHeaders($headers);
 
         $pinIp = str_contains($target['ip'], ':') ? '[' . $target['ip'] . ']' : $target['ip'];
         $collected = '';
@@ -178,6 +231,21 @@ final readonly class SafeHttpClient
                 'timeout' => $req['timeout'] ?? 15,
                 'target' => $this->admitTarget($req['url']),
             ];
+        }
+
+        if (null !== $this->fake) {
+            /** @var array<TKey, array{status: int, body: string}> $fakeResults */
+            $fakeResults = [];
+            foreach ($prepared as $key => $item) {
+                $this->formatHeaders($item['headers']);
+                $res = $this->fake->respond($item['method'], $item['target']['url'], $item['headers'], $item['body']);
+                if (strlen($res['body']) > $this->maxResponseBytes) {
+                    throw new SecurityException(sprintf('Outbound response exceeded maximum bound of %d bytes.', $this->maxResponseBytes));
+                }
+                $fakeResults[$key] = $res;
+            }
+
+            return $fakeResults;
         }
 
         $multi = curl_multi_init();
