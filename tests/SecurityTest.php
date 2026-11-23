@@ -13,11 +13,19 @@ use Kongono\Http\Routing\Get;
 use Kongono\Http\Routing\Middleware;
 use Kongono\Http\Routing\Post;
 use Kongono\Http\Routing\Router;
+use Kongono\Security\Attributes\Authenticated;
 use Kongono\Security\Attributes\Can;
 use Kongono\Security\Attributes\VerifyWebhook;
+use Kongono\Security\Auth\CachePersonalAccessTokenStore;
+use Kongono\Security\Auth\EmailVerifier;
+use Kongono\Security\Auth\LoginThrottler;
 use Kongono\Security\Auth\MagicLinkAuth;
+use Kongono\Security\Auth\MemoryPersonalAccessTokenStore;
 use Kongono\Security\Auth\PasskeyVerifier;
+use Kongono\Security\Auth\PasswordResetBroker;
 use Kongono\Security\Auth\PkceOAuthClient;
+use Kongono\Security\Auth\RememberMeManager;
+use Kongono\Security\Auth\SessionAuth;
 use Kongono\Security\Egress\SafeHttpClient;
 use Kongono\Security\Egress\SafeHttpFake;
 use Kongono\Security\Encryptor;
@@ -28,6 +36,7 @@ use Kongono\Security\Middleware\CorsMiddleware;
 use Kongono\Security\Middleware\CsrfMiddleware;
 use Kongono\Security\Middleware\RateLimitMiddleware;
 use Kongono\Security\Middleware\SecurityHeadersMiddleware;
+use Kongono\Security\Middleware\SessionAuthMiddleware;
 use Kongono\Security\Middleware\VerifyWebhookMiddleware;
 use Kongono\Security\PasswordHasher;
 use Kongono\Security\Principal;
@@ -989,6 +998,238 @@ final class SecurityTest extends TestCase
         } catch (SecurityException $e) {
             self::assertStringContainsString('exceeded maximum bound', $e->getMessage());
         }
+    }
+
+    public function testSessionAuthMiddlewareAuthenticatedAttributeRememberMeRotationAndGatePolicies(): void
+    {
+        $sessionCache = new MemoryCache();
+        $sessionStore = new \Kongono\Http\Session\CacheSessionStore($sessionCache);
+        $rememberCache = new MemoryCache();
+        $remember = new RememberMeManager($rememberCache, cookieName: 'ktest_rem', secure: false);
+        $auth = new SessionAuth();
+
+        $app = App::create(__DIR__)
+            ->middleware(
+                new \Kongono\Http\Session\SessionMiddleware($sessionStore, cookieName: 'ktest_sid', secure: false),
+                new SessionAuthMiddleware(auth: $auth, rememberMe: $remember),
+            )
+            ->controller(SessionAuthDemoController::class)
+            ->routes(static function (Router $r) use ($auth, $remember): void {
+                $r->post('/login', static function (\Kongono\Http\Session\Session $session) use ($auth, $remember): Response {
+                    $user = new Principal('usr-42', PrincipalKind::Human, ['orders.read'], ['email' => 'ada@kongono.dev']);
+                    $auth->login($session, $user);
+                    $remCookie = $remember->issue($user);
+
+                    return Response::json(['ok' => true])->withCookie($remCookie);
+                });
+
+                $r->post('/logout', static function (Request $req, \Kongono\Http\Session\Session $session) use ($auth, $remember): Response {
+                    $rawRem = $req->cookie($remember->cookieName());
+                    if (is_string($rawRem)) {
+                        $remember->revokeCookie($rawRem);
+                    }
+                    $auth->logout($session);
+
+                    return Response::json(['logged_out' => true])->withCookie($remember->expiredCookie());
+                });
+            });
+
+        // 1. Unauthenticated browser GET -> 302 /login; unauthenticated API GET -> 401
+        $guest = new \Kongono\Http\Testing\TestClient($app);
+        $guest->get('/dashboard', ['Accept' => 'text/html'])->assertRedirect('/login');
+        $guest->get('/api/profile', ['Accept' => 'application/json'])->assertUnauthorized();
+
+        // 2. Login regenerates session ID (anti-fixation) and sets remember-me cookie
+        $browser = (new \Kongono\Http\Testing\TestClient($app))->withStatefulCookies();
+        $loginRes = $browser->postJson('/login', [])
+            ->assertOk()
+            ->assertCookie('ktest_sid')
+            ->assertCookie('ktest_rem');
+        $firstRememberVal = $loginRes->cookies()['ktest_rem'];
+        self::assertStringContainsString('.', $firstRememberVal);
+
+        $browser->get('/dashboard', ['Accept' => 'text/html'])
+            ->assertOk()
+            ->assertSee('Dashboard: usr-42');
+
+        // 3. Drop session cookie (simulating browser restart) -> RememberMe cookie resumes & rotates!
+        $resumedClient = (new \Kongono\Http\Testing\TestClient($app))
+            ->withStatefulCookies()
+            ->withCookie('ktest_rem', $firstRememberVal);
+        $resumedRes = $resumedClient->get('/dashboard', ['Accept' => 'text/html'])
+            ->assertOk()
+            ->assertSee('Dashboard: usr-42')
+            ->assertCookie('ktest_sid')
+            ->assertCookie('ktest_rem');
+        $rotatedRememberVal = $resumedRes->cookies()['ktest_rem'];
+        self::assertNotSame($firstRememberVal, $rotatedRememberVal);
+
+        // 4. Stolen-cookie theft detection: replaying the OLD cookie revokes the ENTIRE series (including rotated cookie)!
+        $thiefClient = (new \Kongono\Http\Testing\TestClient($app))
+            ->withCookie('ktest_rem', $firstRememberVal);
+        $thiefClient->get('/dashboard', ['Accept' => 'text/html'])
+            ->assertRedirect('/login')
+            ->assertCookie('ktest_rem', '');
+
+        // Now even the rotated cookie from the compromised series is rejected!
+        $afterTheft = (new \Kongono\Http\Testing\TestClient($app))
+            ->withCookie('ktest_rem', $rotatedRememberVal);
+        $afterTheft->get('/dashboard', ['Accept' => 'text/html'])->assertRedirect('/login');
+
+        // 5. Logout invalidates session cleanly
+        $browser->postJson('/logout', [])->assertOk()->assertCookie('ktest_sid', '');
+        $browser->get('/dashboard', ['Accept' => 'text/html'])->assertRedirect('/login');
+
+        // 6. Gate::before() + resource-class Gate::policy() + Gate::denies()
+        $gate = (new Gate())
+            ->before(static function (Principal $p): ?bool {
+                if (true === ($p->attributes['suspended'] ?? false)) {
+                    return false;
+                }
+                if ($p->hasCapability('*')) {
+                    return true;
+                }
+
+                return null;
+            })
+            ->policy(OrderResourceFixture::class, new OrderPolicyFixture());
+
+        $owner = new Principal('usr-1', PrincipalKind::Human);
+        $other = new Principal('usr-2', PrincipalKind::Human);
+        $superAdmin = new Principal('usr-0', PrincipalKind::Human, ['*']);
+        $suspended = new Principal('usr-1', PrincipalKind::Human, ['*'], ['suspended' => true]);
+        $order = new OrderResourceFixture('ord-99', 'usr-1');
+
+        self::assertTrue($gate->allows($owner, 'orders.update', $order));
+        self::assertTrue($gate->denies($other, 'orders.update', $order));
+        self::assertTrue($gate->allows($superAdmin, 'orders.update', $order));
+        self::assertTrue($gate->denies($suspended, 'orders.update', $order));
+    }
+
+    public function testRevocablePersonalAccessTokensPasswordResetEmailVerifierAndLoginThrottler(): void
+    {
+        // 1. Personal Access Tokens (Memory + Cache stores) + BearerAuthMiddleware + SecretScrubber
+        $baseNow = time();
+        foreach ([new MemoryPersonalAccessTokenStore(), new CachePersonalAccessTokenStore(new MemoryCache())] as $store) {
+            $principal = new Principal('usr-77', PrincipalKind::Human, ['orders.read', 'orders.write', 'admin.delete']);
+            $issued = $store->issue($principal, 'CI Deploy Key', capabilities: ['orders.read'], ttlSeconds: 3600, now: $baseNow);
+
+            self::assertStringStartsWith('kgn_pat_', $issued->plainTextToken);
+            // Plaintext secret is NEVER stored in the token hash and is scrubbed automatically by SecretScrubber
+            self::assertNotSame($issued->plainTextToken, $issued->record->tokenHash);
+            self::assertStringNotContainsString($issued->plainTextToken, \Kongono\Core\Diagnostics\SecretScrubber::scrub('Leaked ' . $issued->plainTextToken));
+
+            $auth = $store->authenticate($issued->plainTextToken, now: $baseNow + 50);
+            self::assertNotNull($auth);
+            self::assertSame($baseNow + 50, $auth->lastUsedAt);
+            self::assertSame(['orders.read'], $auth->capabilities);
+
+            // Works directly with BearerAuthMiddleware($store->toBearerResolver())
+            $patApp = App::create(__DIR__)
+                ->middleware(new BearerAuthMiddleware($store->toBearerResolver()))
+                ->routes(static function (Router $r): void {
+                    $r->get('/api/orders', static fn(Principal $p): Response => Response::json(['id' => $p->id]))
+                        ->middlewareAttributes(new Can('orders.read'));
+                    $r->delete('/api/orders', static fn(): Response => Response::text('deleted'))
+                        ->middlewareAttributes(new Can('admin.delete'));
+                });
+            $client = (new \Kongono\Http\Testing\TestClient($patApp))->withBearerToken($issued->plainTextToken);
+            $client->get('/api/orders')->assertOk()->assertJsonPath('id', 'usr-77');
+            $client->delete('/api/orders')->assertForbidden();
+
+            // Expired token rejected fail-closed
+            self::assertNull($store->authenticate($issued->plainTextToken, now: $baseNow + 5000));
+
+            // Instant revocation & revokeAllForPrincipal
+            $t1 = $store->issue($principal, 'Key 1', now: $baseNow);
+            $t2 = $store->issue($principal, 'Key 2', now: $baseNow);
+            self::assertCount(2, $store->listForPrincipal('usr-77'));
+            self::assertTrue($store->revoke($t1->record->id));
+            self::assertNull($store->authenticate($t1->plainTextToken, now: $baseNow + 5));
+            self::assertSame(1, $store->revokeAllForPrincipal('usr-77'));
+            self::assertNull($store->authenticate($t2->plainTextToken, now: $baseNow + 5));
+        }
+
+        // 2. PasswordResetBroker: SHA-256 hashed, wrong guess does NOT DoS pending token, replacement invalidates old, single-use consume
+        $resetBroker = new PasswordResetBroker(new MemoryCache());
+        $tok1 = $resetBroker->createToken('Ada@Kongono.dev', ttlSeconds: 600, now: 1000);
+        self::assertTrue($resetBroker->verify('ada@kongono.dev', $tok1, now: 1010));
+        self::assertFalse($resetBroker->consume('ada@kongono.dev', 'wrong-guess', now: 1015));
+        // Legitimate token still valid after wrong guess!
+        self::assertTrue($resetBroker->verify('ada@kongono.dev', $tok1, now: 1020));
+
+        // Issuing a second token invalidates tok1 automatically
+        $tok2 = $resetBroker->createToken('ada@kongono.dev', ttlSeconds: 600, now: 1030);
+        self::assertFalse($resetBroker->consume('ada@kongono.dev', $tok1, now: 1035));
+        self::assertTrue($resetBroker->consume('ada@kongono.dev', $tok2, now: 1040));
+        // Single-use replay rejected
+        self::assertFalse($resetBroker->consume('ada@kongono.dev', $tok2, now: 1045));
+
+        // 3. EmailVerifier: domain-separated, raw email never exposed in URL, changing email invalidates link
+        $secret = 'email-verify-domain-sep-secret-32bytes!';
+        $verifier = new EmailVerifier($secret);
+        $verifyLink = $verifier->createVerificationLink('/auth/verify-email', 'usr-42', 'Ada@Kongono.dev', ttlSeconds: 3600, now: 1000);
+        self::assertStringNotContainsString('ada@kongono.dev', strtolower($verifyLink));
+        self::assertTrue($verifier->verifyLink($verifyLink, 'usr-42', 'ada@kongono.dev', now: 1500));
+        self::assertFalse($verifier->verifyLink($verifyLink, 'usr-99', 'ada@kongono.dev', now: 1500));
+        self::assertFalse($verifier->verifyLink($verifyLink, 'usr-42', 'changed@kongono.dev', now: 1500));
+        self::assertFalse($verifier->verifyLink($verifyLink, 'usr-42', 'ada@kongono.dev', now: 5000));
+
+        // 4. LoginThrottler: (identifier + IP) lockout + Retry-After + clear() + distributed multi-IP account cap
+        $throttler = new LoginThrottler(new MemoryCache(), maxAttempts: 3, lockoutSeconds: 300, maxAccountAttempts: 5);
+        self::assertFalse($throttler->isLockedOut('ada@kongono.dev', '203.0.113.10', now: 1000));
+        self::assertSame(3, $throttler->remainingAttempts('ada@kongono.dev', '203.0.113.10', now: 1000));
+
+        $throttler->recordFailure('ada@kongono.dev', '203.0.113.10', now: 1000);
+        $throttler->recordFailure('ada@kongono.dev', '203.0.113.10', now: 1005);
+        $throttler->recordFailure('ada@kongono.dev', '203.0.113.10', now: 1010);
+
+        self::assertTrue($throttler->isLockedOut('ada@kongono.dev', '203.0.113.10', now: 1020));
+        self::assertSame(280, $throttler->retryAfterSeconds('ada@kongono.dev', '203.0.113.10', now: 1020));
+        // Another IP is NOT yet locked out (prevents single-IP DoS until account cap hits)
+        self::assertFalse($throttler->isLockedOut('ada@kongono.dev', '198.51.100.9', now: 1020));
+
+        // 2 more failures from distinct IPs hit maxAccountAttempts (5) -> stops distributed botnet spray!
+        $throttler->recordFailure('ada@kongono.dev', '198.51.100.9', now: 1025);
+        $throttler->recordFailure('ada@kongono.dev', '198.51.100.10', now: 1030);
+        self::assertTrue($throttler->isLockedOut('ada@kongono.dev', '198.51.100.99', now: 1035));
+
+        // Successful login clears counters cleanly
+        $throttler->clear('ada@kongono.dev', '203.0.113.10');
+        self::assertFalse($throttler->isLockedOut('ada@kongono.dev', '203.0.113.10', now: 1040));
+    }
+}
+
+final readonly class SessionAuthDemoController
+{
+    #[Get('/dashboard', name: 'dashboard')]
+    #[Authenticated(redirectTo: '/login')]
+    public function dashboard(Principal $principal): Response
+    {
+        return Response::html('<h1>Dashboard: ' . $principal->id . '</h1>');
+    }
+
+    #[Get('/api/profile', name: 'api.profile')]
+    #[Authenticated]
+    public function apiProfile(Principal $principal): Response
+    {
+        return Response::json(['id' => $principal->id]);
+    }
+}
+
+final readonly class OrderResourceFixture
+{
+    public function __construct(
+        public string $id,
+        public string $ownerId,
+    ) {}
+}
+
+final readonly class OrderPolicyFixture
+{
+    public function update(Principal $principal, OrderResourceFixture $order): bool
+    {
+        return $principal->id === $order->ownerId;
     }
 }
 
