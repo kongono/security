@@ -39,10 +39,10 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
         }
 
         $cookies = $request->getCookieParams();
-        $hasSessionCookie = array_key_exists($this->sessionCookieName, $cookies);
+        $hasAnyCookie = [] !== $cookies || '' !== trim($request->getHeaderLine('Cookie'));
         $authHeader = trim($request->getHeaderLine('Authorization'));
-        // Stateless Bearer-authenticated API requests that do not send a session cookie are immune to ambient-cookie CSRF
-        if (!$hasSessionCookie && str_starts_with(strtolower($authHeader), 'bearer ') && strlen($authHeader) > 7) {
+        // Stateless Bearer-authenticated API requests that send zero ambient cookies are immune to ambient-cookie CSRF
+        if (!$hasAnyCookie && str_starts_with(strtolower($authHeader), 'bearer ') && strlen($authHeader) > 7) {
             return $handler->handle($request);
         }
 
@@ -56,13 +56,15 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
             && 1 !== preg_match('/%(?:2e|2f|5c|25|00)/i', $rawPath)
         ) {
             $normalizedPath = (string) preg_replace('#/+#', '/', '/' . ltrim($rawPath, '/'));
+            $canonicalPath = '/' === $normalizedPath ? '/' : rtrim($normalizedPath, '/');
             foreach ($this->exemptPrefixes as $prefix) {
                 if ('' === $prefix) {
                     continue;
                 }
-                $matches = str_ends_with($prefix, '/')
-                    ? str_starts_with($normalizedPath, $prefix)
-                    : ($normalizedPath === $prefix || str_starts_with($normalizedPath, $prefix . '/'));
+                $normalizedPrefix = (string) preg_replace('#/+#', '/', '/' . ltrim($prefix, '/'));
+                $matches = str_ends_with($normalizedPrefix, '/')
+                    ? ('/' === $normalizedPrefix || str_starts_with($canonicalPath, $normalizedPrefix))
+                    : ($canonicalPath === $normalizedPrefix || str_starts_with($canonicalPath, $normalizedPrefix . '/'));
                 if ($matches) {
                     return $handler->handle($request);
                 }

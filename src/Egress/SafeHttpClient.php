@@ -97,10 +97,13 @@ final class SafeHttpClient implements EgressGuardableInterface
         foreach ($this->rootGuards as $guard) {
             $guard($url);
         }
-        $fiber = Fiber::getCurrent();
-        if (null !== $fiber && null !== $this->fiberGuards && isset($this->fiberGuards[$fiber])) {
-            foreach ($this->fiberGuards[$fiber] as $guard) {
-                $guard($url);
+        if (null !== $this->fiberGuards) {
+            foreach ($this->fiberGuards as $candidateFiber => $guards) {
+                if ($candidateFiber instanceof Fiber && $candidateFiber->isRunning()) {
+                    foreach ($guards as $guard) {
+                        $guard($url);
+                    }
+                }
             }
         }
     }

@@ -89,8 +89,13 @@ final readonly class PersonalAccessToken
             return null;
         }
 
-        $kindVal = is_string($data['principal_kind'] ?? null) ? $data['principal_kind'] : PrincipalKind::Human->value;
-        $kind = PrincipalKind::tryFrom($kindVal) ?? PrincipalKind::Human;
+        if (!is_string($data['principal_kind'] ?? null)) {
+            return null;
+        }
+        $kind = PrincipalKind::tryFrom($data['principal_kind']);
+        if (null === $kind) {
+            return null;
+        }
 
         /** @var list<string> $capabilities */
         $capabilities = [];

@@ -69,8 +69,20 @@ final readonly class CorsMiddleware implements MiddlewareInterface
                     }
                 }
                 if (!self::headerArrayHasVaryOrigin($headers)) {
-                    $headers['Vary'] = isset($headers['Vary']) && '' !== trim($headers['Vary'])
-                        ? $headers['Vary'] . ', Origin'
+                    $existingVaryKey = null;
+                    $existingVaryValue = '';
+                    foreach ($headers as $k => $v) {
+                        if ('vary' === strtolower($k)) {
+                            $existingVaryKey = $k;
+                            $existingVaryValue = trim(is_array($v) ? implode(', ', $v) : $v);
+                            break;
+                        }
+                    }
+                    if (null !== $existingVaryKey && 'Vary' !== $existingVaryKey) {
+                        unset($headers[$existingVaryKey]);
+                    }
+                    $headers['Vary'] = '' !== $existingVaryValue
+                        ? $existingVaryValue . ', Origin'
                         : 'Origin';
                 }
 
@@ -131,17 +143,20 @@ final readonly class CorsMiddleware implements MiddlewareInterface
         return false;
     }
 
-    /** @param array<string, string> $headers */
+    /** @param array<string, string|list<string>> $headers */
     private static function headerArrayHasVaryOrigin(array $headers): bool
     {
         foreach ($headers as $k => $v) {
             if ('vary' !== strtolower($k)) {
                 continue;
             }
-            foreach (explode(',', $v) as $token) {
-                $t = strtolower(trim($token));
-                if ('origin' === $t || '*' === $t) {
-                    return true;
+            $lines = is_array($v) ? $v : [$v];
+            foreach ($lines as $line) {
+                foreach (explode(',', $line) as $token) {
+                    $t = strtolower(trim($token));
+                    if ('origin' === $t || '*' === $t) {
+                        return true;
+                    }
                 }
             }
         }

@@ -69,14 +69,20 @@ final readonly class LoginThrottler
     /** Clear failure counters after a successful authentication. */
     public function clear(string $identifier, string $clientIp): void
     {
-        $pairKey = $this->pairKey($identifier, $clientIp);
-        $this->cache->delete($pairKey);
-        $this->cache->delete($pairKey . ':reset');
+        $this->clearBucket($this->pairKey($identifier, $clientIp));
         if ($this->maxAccountAttempts > 0) {
-            $acctKey = $this->accountKey($identifier);
-            $this->cache->delete($acctKey);
-            $this->cache->delete($acctKey . ':reset');
+            $this->clearBucket($this->accountKey($identifier));
         }
+    }
+
+    private function clearBucket(string $key): void
+    {
+        $reset = $this->cache->get($key . ':reset');
+        if (is_int($reset)) {
+            $this->cache->delete($key . ':c:' . $reset);
+        }
+        $this->cache->delete($key);
+        $this->cache->delete($key . ':reset');
     }
 
     private function bucketRetryAfter(string $key, int $limit, int $now): int
@@ -96,25 +102,30 @@ final readonly class LoginThrottler
             $resetKey = $key . ':reset';
             $existingReset = $this->cache->get($resetKey);
             if (!is_int($existingReset)) {
-                if ($this->cache->add($resetKey, $now + $window, $window + 5)) {
-                    $this->cache->delete($key);
-                    $ttl = $window + 5;
+                $targetReset = $now + $window;
+                if ($this->cache->add($resetKey, $targetReset, $window + 5)) {
+                    $resetAt = $targetReset;
                 } else {
                     $reread = $this->cache->get($resetKey);
-                    $ttl = is_int($reread) ? max(1, $reread - $now) + 5 : ($window + 5);
+                    $resetAt = is_int($reread) && $reread > $now ? $reread : $targetReset;
                 }
             } elseif ($now >= $existingReset) {
-                // Single-winner reset guard prevents concurrent requests from repeatedly clearing sibling counts
+                $targetReset = $now + $window;
+                // Single-winner rollover switches to a fresh reset-scoped counter key without deleting active counters
                 if ($this->cache->add($key . ':roll:' . $existingReset, 1, 10)) {
-                    $this->cache->delete($key);
-                    $this->cache->set($resetKey, $now + $window, $window + 5);
+                    $this->cache->set($resetKey, $targetReset, $window + 5);
+                    $resetAt = $targetReset;
+                } else {
+                    $reread = $this->cache->get($resetKey);
+                    $resetAt = is_int($reread) && $reread > $now ? $reread : $targetReset;
                 }
-                $ttl = $window + 5;
             } else {
-                $ttl = max(1, $existingReset - $now) + 5;
+                $resetAt = $existingReset;
             }
 
-            return $this->cache->increment($key, 1, $ttl);
+            $ttl = max(1, $resetAt - $now) + 5;
+
+            return $this->cache->increment($key . ':c:' . $resetAt, 1, $ttl);
         }
 
         $bucket = $this->readBucket($key, $now);
@@ -134,10 +145,13 @@ final readonly class LoginThrottler
     private function readBucket(string $key, int $now): array
     {
         if ($this->cache instanceof AtomicCacheInterface) {
-            $countRaw = $this->cache->get($key);
             $resetRaw = $this->cache->get($key . ':reset');
-            if (!is_int($countRaw) || !is_int($resetRaw) || $now >= $resetRaw) {
+            if (!is_int($resetRaw) || $now >= $resetRaw) {
                 return ['count' => 0, 'reset_at' => $now + max(1, $this->lockoutSeconds)];
+            }
+            $countRaw = $this->cache->get($key . ':c:' . $resetRaw);
+            if (!is_int($countRaw)) {
+                return ['count' => 0, 'reset_at' => $resetRaw];
             }
 
             return ['count' => $countRaw, 'reset_at' => $resetRaw];
@@ -156,7 +170,29 @@ final readonly class LoginThrottler
 
     private function pairKey(string $identifier, string $clientIp): string
     {
-        return $this->prefix . 'pair:' . hash('sha256', strtolower(trim($identifier)) . '|' . trim($clientIp));
+        return $this->prefix . 'pair:' . hash('sha256', strtolower(trim($identifier)) . '|' . self::normalizeIp($clientIp));
+    }
+
+    private static function normalizeIp(string $ip): string
+    {
+        $trimmed = trim($ip);
+        if ('' === $trimmed) {
+            return '';
+        }
+        $packed = @inet_pton($trimmed);
+        if (false === $packed) {
+            return strtolower($trimmed);
+        }
+        // Unwrap IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) so IPv4 and mapped IPv6 share one bucket
+        if (16 === strlen($packed) && str_starts_with($packed, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff")) {
+            $v4 = @inet_ntop(substr($packed, 12));
+            if (false !== $v4) {
+                return strtolower($v4);
+            }
+        }
+        $canonical = @inet_ntop($packed);
+
+        return false !== $canonical ? strtolower($canonical) : strtolower($trimmed);
     }
 
     private function accountKey(string $identifier): string

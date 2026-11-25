@@ -129,7 +129,14 @@ final readonly class Totp
         }
 
         if (null !== $replayCache) {
-            $replayKey = 'kongono:totp:used:' . hash('sha256', $key . ':' . $this->algorithm . ':' . $this->digits . ':' . $this->period . ':' . $matchedStep);
+            $secretScope = hash('sha256', $key . ':' . $this->algorithm . ':' . $this->digits . ':' . $this->period);
+            $lastStepKey = 'kongono:totp:last:' . $secretScope;
+            $cachedLast = $replayCache->get($lastStepKey);
+            if (is_int($cachedLast) && $matchedStep <= $cachedLast) {
+                return null;
+            }
+
+            $replayKey = 'kongono:totp:used:' . hash('sha256', $secretScope . ':' . $matchedStep);
             $ttl = (2 * $drift + 2) * $this->period;
             if ($replayCache instanceof AtomicCacheInterface) {
                 if (!$replayCache->add($replayKey, true, $ttl)) {
@@ -141,6 +148,9 @@ final readonly class Totp
                 }
                 $replayCache->set($replayKey, true, $ttl);
             }
+
+            $nextLast = is_int($cachedLast) ? max($cachedLast, $matchedStep) : $matchedStep;
+            $replayCache->set($lastStepKey, $nextLast, $ttl);
         }
 
         return $matchedStep;

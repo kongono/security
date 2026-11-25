@@ -105,24 +105,13 @@ final readonly class SessionAuthMiddleware implements MiddlewareInterface
             $response = $handler->handle($request);
         } catch (HttpException $e) {
             if (null !== $rotatedCookie) {
-                $headers = $e->headers;
-                $headers['Set-Cookie'] = $rotatedCookie->toHeaderValue();
-                $existingCcKey = null;
-                foreach (array_keys($headers) as $k) {
-                    if ('cache-control' === strtolower($k)) {
-                        $existingCcKey = $k;
-                        break;
-                    }
-                }
-                $ccVal = null !== $existingCcKey ? strtolower($headers[$existingCcKey]) : '';
+                $enriched = $e->withAddedHeader('Set-Cookie', $rotatedCookie->toHeaderValue());
+                $ccVal = strtolower($enriched->headerLine('Cache-Control'));
                 if ('' === $ccVal || (!str_contains($ccVal, 'private') && !str_contains($ccVal, 'no-store'))) {
-                    if (null !== $existingCcKey) {
-                        unset($headers[$existingCcKey]);
-                    }
-                    $headers['Cache-Control'] = 'private, no-cache="Set-Cookie"';
+                    $enriched = $enriched->withHeader('Cache-Control', 'private, no-cache="Set-Cookie"');
                 }
 
-                throw new HttpException($e->statusCode, $e->getMessage(), $headers, $e->diagnostic, $e);
+                throw $enriched;
             }
             throw $e;
         }

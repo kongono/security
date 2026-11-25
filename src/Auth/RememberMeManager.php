@@ -46,7 +46,12 @@ final readonly class RememberMeManager
         $effectiveTtl = min(max(60, $ttlSeconds), $maxCap);
         $absoluteExpiresAt = $ts + $maxCap;
 
-        return $this->issueInSeries($principal, $series, $effectiveTtl, $ts, $absoluteExpiresAt);
+        $cookie = $this->issueInSeries($principal, $series, $effectiveTtl, $ts, $absoluteExpiresAt);
+        if (null === $cookie) {
+            throw new \RuntimeException('Unable to issue remember-me cookie for a revoked login series.');
+        }
+
+        return $cookie;
     }
 
     /**
@@ -87,12 +92,26 @@ final readonly class RememberMeManager
         $expiresAt = is_int($raw['expires_at'] ?? null) ? $raw['expires_at'] : 0;
         $absoluteExpiresAt = is_int($raw['absolute_expires_at'] ?? null) ? $raw['absolute_expires_at'] : $expiresAt;
         $ttl = is_int($raw['ttl'] ?? null) ? $raw['ttl'] : 2_592_000;
+        $tokenRevGen = is_int($raw['revocation_gen'] ?? null) ? $raw['revocation_gen'] : 0;
         $ownerId = is_array($raw['principal'] ?? null) && is_string($raw['principal']['id'] ?? null) ? $raw['principal']['id'] : null;
 
         if ('' === $series || '' === $validatorHash || $ts >= $expiresAt || $ts >= $absoluteExpiresAt) {
             if ('' !== $series) {
                 $this->revokeSeries($series, $ownerId);
             }
+
+            return null;
+        }
+
+        if (null !== $this->cache->get($this->seriesRevokedKey($series))) {
+            $this->revokeSeries($series, $ownerId);
+
+            return null;
+        }
+
+        $currentGen = null !== $ownerId ? $this->currentRevocationGen($ownerId) : 0;
+        if (null !== $ownerId && $tokenRevGen < $currentGen) {
+            $this->revokeSeries($series, $ownerId);
 
             return null;
         }
@@ -116,7 +135,10 @@ final readonly class RememberMeManager
         $remaining = max(60, min($expiresAt, $absoluteExpiresAt) - $ts, $nextTtl);
         $this->cache->set($this->usedKey($parsed['selector']), $series, $remaining);
 
-        $rotatedCookie = $this->issueInSeries($principal, $series, $nextTtl, $ts, $absoluteExpiresAt);
+        $rotatedCookie = $this->issueInSeries($principal, $series, $nextTtl, $ts, $absoluteExpiresAt, expectedRevGen: $currentGen);
+        if (null === $rotatedCookie) {
+            return null;
+        }
 
         return [
             'principal' => $principal,
@@ -158,6 +180,14 @@ final readonly class RememberMeManager
     /** Revoke every active remember-me series for a principal (e.g. on password reset or logout-all). */
     public function revokeAllForPrincipal(string $principalId): int
     {
+        $genTtl = max(60, $this->maxAbsoluteLifetimeSeconds) + 3600;
+        $genKey = $this->principalRevGenKey($principalId);
+        if ($this->cache instanceof AtomicCacheInterface) {
+            $this->cache->increment($genKey, 1, $genTtl);
+        } else {
+            $this->cache->set($genKey, $this->currentRevocationGen($principalId) + 1, $genTtl);
+        }
+
         $raw = $this->cache->get($this->principalSeriesKey($principalId));
         $this->cache->delete($this->principalSeriesKey($principalId));
         if (!is_array($raw)) {
@@ -189,14 +219,33 @@ final readonly class RememberMeManager
         );
     }
 
-    private function issueInSeries(Principal $principal, string $series, int $ttlSeconds, int $now, int $absoluteExpiresAt): Cookie
-    {
+    private function issueInSeries(
+        Principal $principal,
+        string $series,
+        int $ttlSeconds,
+        int $now,
+        int $absoluteExpiresAt,
+        ?int $expectedRevGen = null,
+    ): ?Cookie {
+        if (null !== $this->cache->get($this->seriesRevokedKey($series))) {
+            return null;
+        }
+
         $selector = bin2hex(random_bytes(12));
         $validator = bin2hex(random_bytes(32));
+        $revGen = $expectedRevGen ?? $this->currentRevocationGen($principal->id);
+
+        if (null !== $expectedRevGen && $this->currentRevocationGen($principal->id) !== $expectedRevGen) {
+            $this->revokeSeries($series, $principal->id);
+
+            return null;
+        }
 
         $this->cache->set($this->selectorKey($selector), [
             'series' => $series,
             'validator_hash' => hash('sha256', $validator),
+            'issued_at' => $now,
+            'revocation_gen' => $revGen,
             'expires_at' => $now + $ttlSeconds,
             'absolute_expires_at' => $absoluteExpiresAt,
             'ttl' => $ttlSeconds,
@@ -210,20 +259,52 @@ final readonly class RememberMeManager
 
         $this->cache->set($this->seriesKey($series), $selector, $ttlSeconds + 5);
 
+        // Post-write race guard: if revokeSeries() or revokeAllForPrincipal() raced in during rotation, roll back immediately
+        if (
+            null !== $this->cache->get($this->seriesRevokedKey($series))
+            || (null !== $expectedRevGen && $this->currentRevocationGen($principal->id) !== $expectedRevGen)
+        ) {
+            $this->cache->delete($this->selectorKey($selector));
+            $this->cache->delete($this->seriesKey($series));
+            $this->revokeSeries($series, $principal->id);
+
+            return null;
+        }
+
         $pKey = $this->principalSeriesKey($principal->id);
         $existing = $this->cache->get($pKey);
         /** @var list<string> $seriesList */
         $seriesList = [];
+        $pruned = false;
         if (is_array($existing)) {
             foreach ($existing as $item) {
                 if (is_string($item) && '' !== $item) {
-                    $seriesList[] = $item;
+                    if ($item === $series || $this->cache->has($this->seriesKey($item))) {
+                        $seriesList[] = $item;
+                    } else {
+                        $pruned = true;
+                    }
                 }
             }
         }
         if (!in_array($series, $seriesList, true)) {
             $seriesList[] = $series;
+            $pruned = true;
+        }
+        if ($pruned) {
             $this->cache->set($pKey, $seriesList, max($ttlSeconds, $this->maxAbsoluteLifetimeSeconds) + 60);
+        }
+
+        // Final verification after updating the principal series index
+        if (
+            null !== $this->cache->get($this->seriesRevokedKey($series))
+            || (null !== $expectedRevGen && $this->currentRevocationGen($principal->id) !== $expectedRevGen)
+        ) {
+            $this->cache->delete($this->selectorKey($selector));
+            $this->cache->delete($this->seriesKey($series));
+            $this->revokeSeries($series, $principal->id);
+
+            return null;
         }
 
         return new Cookie(
@@ -239,6 +320,9 @@ final readonly class RememberMeManager
 
     private function revokeSeries(string $series, ?string $principalId = null): void
     {
+        // Write a series tombstone FIRST so any concurrent consumeAndRotate() cannot resurrect this series
+        $this->cache->set($this->seriesRevokedKey($series), 1, max(60, $this->maxAbsoluteLifetimeSeconds) + 3600);
+
         $activeSelector = $this->cache->get($this->seriesKey($series));
         if (is_string($activeSelector) && '' !== $activeSelector) {
             if (null === $principalId) {
@@ -339,6 +423,11 @@ final readonly class RememberMeManager
         return $this->prefix . 'series:' . $series;
     }
 
+    private function seriesRevokedKey(string $series): string
+    {
+        return $this->prefix . 'srev:' . $series;
+    }
+
     private function usedKey(string $selector): string
     {
         return $this->prefix . 'used:' . $selector;
@@ -347,5 +436,17 @@ final readonly class RememberMeManager
     private function principalSeriesKey(string $principalId): string
     {
         return $this->prefix . 'pseries:' . hash('sha256', $principalId);
+    }
+
+    private function principalRevGenKey(string $principalId): string
+    {
+        return $this->prefix . 'prevgen:' . hash('sha256', $principalId);
+    }
+
+    private function currentRevocationGen(string $principalId): int
+    {
+        $raw = $this->cache->get($this->principalRevGenKey($principalId));
+
+        return is_int($raw) ? $raw : 0;
     }
 }

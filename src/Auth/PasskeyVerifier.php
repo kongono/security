@@ -32,7 +32,7 @@ final readonly class PasskeyVerifier
     public function createChallenge(string $rpId, string $origin, int $ttlSeconds = 300, ?int $now = null): array
     {
         $cleanRpId = strtolower(trim($rpId));
-        $cleanOrigin = rtrim(trim($origin), '/');
+        $cleanOrigin = strtolower(rtrim(trim($origin), '/'));
         if ('' === $cleanRpId || '' === $cleanOrigin) {
             throw new SecurityException('Passkey rpId and origin are required.');
         }
@@ -96,7 +96,7 @@ final readonly class PasskeyVerifier
             throw new SecurityException('Stored passkey challenge metadata is invalid.');
         }
 
-        if (($now ?? time()) > $meta['expiresAt']) {
+        if (($now ?? time()) >= $meta['expiresAt']) {
             throw new SecurityException('Passkey challenge has expired.');
         }
 
@@ -115,8 +115,8 @@ final readonly class PasskeyVerifier
             throw new SecurityException('Passkey challenge mismatch.');
         }
 
-        $receivedOrigin = is_string($clientData['origin'] ?? null) ? rtrim($clientData['origin'], '/') : '';
-        if (!hash_equals($meta['origin'], $receivedOrigin)) {
+        $receivedOrigin = is_string($clientData['origin'] ?? null) ? strtolower(rtrim($clientData['origin'], '/')) : '';
+        if (!hash_equals(strtolower($meta['origin']), $receivedOrigin)) {
             throw new SecurityException('Passkey origin mismatch.');
         }
 
@@ -128,10 +128,10 @@ final readonly class PasskeyVerifier
             if (!$allowCrossOrigin) {
                 throw new SecurityException('Cross-origin passkey assertions are denied by policy.');
             }
-            $topOrigin = is_string($clientData['topOrigin'] ?? null) ? rtrim($clientData['topOrigin'], '/') : '';
+            $topOrigin = is_string($clientData['topOrigin'] ?? null) ? strtolower(rtrim($clientData['topOrigin'], '/')) : '';
             $matchedTopOrigin = false;
             foreach ($allowedTopOrigins as $allowedTop) {
-                if ('' !== $topOrigin && hash_equals(rtrim($allowedTop, '/'), $topOrigin)) {
+                if ('' !== $topOrigin && hash_equals(strtolower(rtrim($allowedTop, '/')), $topOrigin)) {
                     $matchedTopOrigin = true;
                 }
             }
@@ -157,6 +157,7 @@ final readonly class PasskeyVerifier
         $backupEligible = 0 !== ($flags & 0x08);
         $backupState = 0 !== ($flags & 0x10);
         $attestedDataIncluded = 0 !== ($flags & 0x40);
+        $extensionDataIncluded = 0 !== ($flags & 0x80);
         if (!$userPresent) {
             throw new SecurityException('Passkey User Present (UP) flag is not set.');
         }
@@ -168,6 +169,12 @@ final readonly class PasskeyVerifier
         }
         if ($attestedDataIncluded) {
             throw new SecurityException('Unexpected attested credential data flag (AT) in passkey assertion.');
+        }
+        if (!$extensionDataIncluded && 37 !== strlen($authData)) {
+            throw new SecurityException('Passkey authenticatorData contains trailing bytes without ED flag.');
+        }
+        if ($extensionDataIncluded && strlen($authData) <= 37) {
+            throw new SecurityException('Passkey authenticatorData sets ED flag without extension payload.');
         }
 
         $unpacked = unpack('Ncount', substr($authData, 33, 4));
@@ -204,7 +211,14 @@ final readonly class PasskeyVerifier
 
     public static function base64UrlDecode(string $encoded): string
     {
-        $normalized = strtr($encoded, '-_', '+/');
+        if ('' === $encoded || 1 !== preg_match('/\A[A-Za-z0-9_-]+={0,2}\z/', $encoded)) {
+            throw new SecurityException('Invalid base64url payload.');
+        }
+        $unpadded = rtrim($encoded, '=');
+        if (1 === (strlen($unpadded) % 4)) {
+            throw new SecurityException('Invalid base64url payload length.');
+        }
+        $normalized = strtr($unpadded, '-_', '+/');
         $pad = strlen($normalized) % 4;
         if ($pad > 0) {
             $normalized .= str_repeat('=', 4 - $pad);

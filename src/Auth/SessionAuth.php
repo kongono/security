@@ -52,8 +52,13 @@ final readonly class SessionAuth
             return null;
         }
 
-        $kindVal = is_string($raw['kind'] ?? null) ? $raw['kind'] : PrincipalKind::Human->value;
-        $kind = PrincipalKind::tryFrom($kindVal) ?? PrincipalKind::Human;
+        if (!is_string($raw['kind'] ?? null)) {
+            return null;
+        }
+        $kind = PrincipalKind::tryFrom($raw['kind']);
+        if (null === $kind) {
+            return null;
+        }
 
         /** @var list<string> $capabilities */
         $capabilities = [];

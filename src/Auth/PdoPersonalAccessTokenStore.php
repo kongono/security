@@ -6,6 +6,7 @@ namespace Kongono\Security\Auth;
 
 use Closure;
 use Kongono\Database\ConnectionInterface;
+use Kongono\Database\Dialect;
 use Kongono\Security\Principal;
 use Kongono\Security\PrincipalKind;
 use Kongono\Security\SecurityException;
@@ -24,7 +25,13 @@ final readonly class PdoPersonalAccessTokenStore implements PersonalAccessTokenS
 
     public function installSchema(): void
     {
-        $t = $this->db->dialect()->quoteIdentifier($this->table);
+        $dialect = $this->db->dialect();
+        $t = $dialect->quoteIdentifier($this->table);
+        $idxName = $dialect->quoteIdentifier('idx_' . $this->table . '_principal_id');
+        $mysqlIndexClause = Dialect::Mysql === $dialect
+            ? sprintf(', INDEX %s (principal_id)', $idxName)
+            : '';
+
         $this->db->execute(sprintf(
             'CREATE TABLE IF NOT EXISTS %s ('
             . 'id VARCHAR(64) PRIMARY KEY, '
@@ -37,9 +44,14 @@ final readonly class PdoPersonalAccessTokenStore implements PersonalAccessTokenS
             . 'created_at BIGINT NOT NULL, '
             . 'expires_at BIGINT, '
             . 'last_used_at BIGINT'
-            . ')',
+            . '%s)',
             $t,
+            $mysqlIndexClause,
         ));
+
+        if (Dialect::Mysql !== $dialect) {
+            $this->db->execute(sprintf('CREATE INDEX IF NOT EXISTS %s ON %s (principal_id)', $idxName, $t));
+        }
     }
 
     public function issue(
@@ -161,8 +173,13 @@ final readonly class PdoPersonalAccessTokenStore implements PersonalAccessTokenS
             return null;
         }
 
-        $kindVal = is_string($row['principal_kind'] ?? null) ? $row['principal_kind'] : PrincipalKind::Human->value;
-        $kind = PrincipalKind::tryFrom($kindVal) ?? PrincipalKind::Human;
+        if (!is_string($row['principal_kind'] ?? null)) {
+            return null;
+        }
+        $kind = PrincipalKind::tryFrom($row['principal_kind']);
+        if (null === $kind) {
+            return null;
+        }
 
         $rawCaps = is_string($row['capabilities'] ?? null) ? json_decode($row['capabilities'], true) : [];
         /** @var list<string> $capabilities */

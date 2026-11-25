@@ -38,18 +38,20 @@ final readonly class CapabilityMiddleware implements MiddlewareInterface
         $cleanups = [];
 
         try {
-            // Attach scoped pre-execution DB SQL guard when a guardable ConnectionInterface is bound
+            // Attach scoped pre-execution DB SQL guard on every distinct guardable DB binding
             if ($active->readOnlyDb || null !== $active->maxQueries) {
+                /** @var list<object> $guardedConnections */
+                $guardedConnections = [];
                 foreach (['Kongono\\Database\\ConnectionInterface', QueryGuardableInterface::class] as $id) {
                     if (!$this->container->hasBinding($id)) {
                         continue;
                     }
                     $conn = $this->container->get($id);
-                    if ($conn instanceof QueryGuardableInterface) {
+                    if ($conn instanceof QueryGuardableInterface && !in_array($conn, $guardedConnections, true)) {
+                        $guardedConnections[] = $conn;
                         $cleanups[] = $conn->guardBeforeQuery(static function (string $sql) use ($active): void {
                             $active->assertDbQueryAllowed($sql);
                         });
-                        break;
                     }
                 }
             }

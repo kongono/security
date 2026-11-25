@@ -57,7 +57,7 @@ final readonly class SecurityHeadersMiddleware implements MiddlewareInterface
         return $response;
     }
 
-    /** @return array<string, string> */
+    /** @return array<string, string|list<string>> */
     private function defaultHeadersFor(ServerRequestInterface $request): array
     {
         $headers = [
