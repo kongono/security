@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kongono\Security\Auth;
 
+use Kongono\Core\Cache\AtomicCacheInterface;
 use Kongono\Core\Cache\CacheInterface;
 
 /**
@@ -40,9 +41,17 @@ final readonly class LoginThrottler
     public function remainingAttempts(string $identifier, string $clientIp, ?int $now = null): int
     {
         $ts = $now ?? time();
-        $state = $this->readBucket($this->pairKey($identifier, $clientIp), $ts);
+        $pairState = $this->readBucket($this->pairKey($identifier, $clientIp), $ts);
+        $pairRemaining = max(0, max(1, $this->maxAttempts) - $pairState['count']);
 
-        return max(0, max(1, $this->maxAttempts) - $state['count']);
+        if ($this->maxAccountAttempts > 0) {
+            $acctState = $this->readBucket($this->accountKey($identifier), $ts);
+            $acctRemaining = max(0, $this->maxAccountAttempts - $acctState['count']);
+
+            return min($pairRemaining, $acctRemaining);
+        }
+
+        return $pairRemaining;
     }
 
     /** Record a failed login attempt and return the updated failure count for `(identifier + clientIp)`. */
@@ -60,9 +69,13 @@ final readonly class LoginThrottler
     /** Clear failure counters after a successful authentication. */
     public function clear(string $identifier, string $clientIp): void
     {
-        $this->cache->delete($this->pairKey($identifier, $clientIp));
+        $pairKey = $this->pairKey($identifier, $clientIp);
+        $this->cache->delete($pairKey);
+        $this->cache->delete($pairKey . ':reset');
         if ($this->maxAccountAttempts > 0) {
-            $this->cache->delete($this->accountKey($identifier));
+            $acctKey = $this->accountKey($identifier);
+            $this->cache->delete($acctKey);
+            $this->cache->delete($acctKey . ':reset');
         }
     }
 
@@ -79,6 +92,31 @@ final readonly class LoginThrottler
     private function incrementBucket(string $key, int $now): int
     {
         $window = max(1, $this->lockoutSeconds);
+        if ($this->cache instanceof AtomicCacheInterface) {
+            $resetKey = $key . ':reset';
+            $existingReset = $this->cache->get($resetKey);
+            if (!is_int($existingReset)) {
+                if ($this->cache->add($resetKey, $now + $window, $window + 5)) {
+                    $this->cache->delete($key);
+                    $ttl = $window + 5;
+                } else {
+                    $reread = $this->cache->get($resetKey);
+                    $ttl = is_int($reread) ? max(1, $reread - $now) + 5 : ($window + 5);
+                }
+            } elseif ($now >= $existingReset) {
+                // Single-winner reset guard prevents concurrent requests from repeatedly clearing sibling counts
+                if ($this->cache->add($key . ':roll:' . $existingReset, 1, 10)) {
+                    $this->cache->delete($key);
+                    $this->cache->set($resetKey, $now + $window, $window + 5);
+                }
+                $ttl = $window + 5;
+            } else {
+                $ttl = max(1, $existingReset - $now) + 5;
+            }
+
+            return $this->cache->increment($key, 1, $ttl);
+        }
+
         $bucket = $this->readBucket($key, $now);
         $nextCount = $bucket['count'] + 1;
         $resetAt = $bucket['count'] > 0 ? $bucket['reset_at'] : ($now + $window);
@@ -95,6 +133,16 @@ final readonly class LoginThrottler
     /** @return array{count: int, reset_at: int} */
     private function readBucket(string $key, int $now): array
     {
+        if ($this->cache instanceof AtomicCacheInterface) {
+            $countRaw = $this->cache->get($key);
+            $resetRaw = $this->cache->get($key . ':reset');
+            if (!is_int($countRaw) || !is_int($resetRaw) || $now >= $resetRaw) {
+                return ['count' => 0, 'reset_at' => $now + max(1, $this->lockoutSeconds)];
+            }
+
+            return ['count' => $countRaw, 'reset_at' => $resetRaw];
+        }
+
         $raw = $this->cache->get($key);
         if (!is_array($raw) || !is_int($raw['count'] ?? null) || !is_int($raw['reset_at'] ?? null)) {
             return ['count' => 0, 'reset_at' => $now + max(1, $this->lockoutSeconds)];

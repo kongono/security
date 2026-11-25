@@ -9,6 +9,7 @@ use Kongono\Core\Cache\AtomicCacheInterface;
 use Kongono\Core\Cache\CacheInterface;
 use Kongono\Http\HttpException;
 use Kongono\Http\Response;
+use Kongono\Http\Stream;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
@@ -41,13 +42,16 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
         '/server-status',
     ];
 
+    /** @var list<string> */
+    private array $canonicalHoneypotPaths;
+
     /**
      * @param list<string>                                   $honeypotPaths
      * @param (Closure(ServerRequestInterface): string)|null $clientResolver
      */
     public function __construct(
         private CacheInterface $cache,
-        private array $honeypotPaths = self::DEFAULT_HONEYPOT_PATHS,
+        array $honeypotPaths = self::DEFAULT_HONEYPOT_PATHS,
         private ?string $honeypotField = '_hp_website',
         private int $banSeconds = 900,
         private int $maxProbesPerWindow = 15,
@@ -55,7 +59,16 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
         private int $maxCostUnitsPerWindow = 0,
         private int $costWindowSeconds = 60,
         private ?Closure $clientResolver = null,
-    ) {}
+    ) {
+        $canonical = [];
+        foreach ($honeypotPaths as $trap) {
+            $norm = $this->canonicalizePath($trap);
+            if ('/' !== $norm) {
+                $canonical[] = $norm;
+            }
+        }
+        $this->canonicalHoneypotPaths = array_values(array_unique($canonical));
+    }
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
@@ -72,10 +85,13 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
             return $this->blockedResponse('honeypot-triggered', 'Forbidden.');
         }
 
-        if (null !== $this->honeypotField && '' !== $this->honeypotField && $this->hasTriggeredHoneypotField($request, $this->honeypotField)) {
-            $this->ban($clientId, 'honeypot_field:' . $this->honeypotField);
+        if (null !== $this->honeypotField && '' !== $this->honeypotField) {
+            [$triggered, $request] = $this->inspectHoneypotField($request, $this->honeypotField);
+            if ($triggered) {
+                $this->ban($clientId, 'honeypot_field:' . $this->honeypotField);
 
-            return $this->blockedResponse('honeypot-field', 'Forbidden.');
+                return $this->blockedResponse('honeypot-field', 'Forbidden.');
+            }
         }
 
         if ($this->maxCostUnitsPerWindow > 0 && $this->currentCostUnits($clientId) >= $this->maxCostUnitsPerWindow) {
@@ -158,11 +174,7 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
 
     private function matchesHoneypotPath(string $normalizedPath): bool
     {
-        foreach ($this->honeypotPaths as $trap) {
-            $canonicalTrap = $this->canonicalizePath($trap);
-            if ('/' === $canonicalTrap) {
-                continue;
-            }
+        foreach ($this->canonicalHoneypotPaths as $canonicalTrap) {
             if ($normalizedPath === $canonicalTrap || str_starts_with($normalizedPath, $canonicalTrap . '/')) {
                 return true;
             }
@@ -211,40 +223,70 @@ final readonly class AiThreatShieldMiddleware implements MiddlewareInterface
         return '/' . strtolower(implode('/', $segments));
     }
 
-    private function hasTriggeredHoneypotField(ServerRequestInterface $request, string $field): bool
+    /**
+     * @return array{0: bool, 1: ServerRequestInterface}
+     */
+    private function inspectHoneypotField(ServerRequestInterface $request, string $field): array
     {
         $method = strtoupper($request->getMethod());
         if (!in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
-            return false;
+            return [false, $request];
         }
         $parsed = $request->getParsedBody();
         if (is_array($parsed) && array_key_exists($field, $parsed)) {
             $value = $parsed[$field];
 
-            return is_string($value) ? '' !== trim($value) : null !== $value && false !== $value;
+            return [is_string($value) ? '' !== trim($value) : null !== $value && false !== $value, $request];
         }
 
-        // Also inspect JSON payloads so bot JSON POSTs cannot bypass the honeypot field check
+        // Also inspect JSON payloads using bounded chunk reads so chunked transfers cannot OOM or bypass honeypots via >1 MiB padding
         if (str_contains(strtolower($request->getHeaderLine('Content-Type')), 'application/json')) {
             $stream = $request->getBody();
             $size = $stream->getSize();
-            if (null === $size || $size <= 1_048_576) {
-                $raw = (string) $stream;
-                if ($stream->isSeekable()) {
+            $maxBytes = 1_048_576;
+            if (null !== $size && $size > $maxBytes) {
+                throw new HttpException(413, 'Request payload exceeds maximum inspectable size.');
+            }
+            $seekable = $stream->isSeekable();
+            if ($seekable) {
+                $stream->rewind();
+            }
+            $raw = '';
+            $exceeded = false;
+            while (!$stream->eof()) {
+                $chunk = $stream->read(65536);
+                if ('' === $chunk) {
+                    break;
+                }
+                $raw .= $chunk;
+                if (strlen($raw) > $maxBytes) {
+                    $exceeded = true;
+                    break;
+                }
+            }
+            if ($exceeded) {
+                if ($seekable) {
                     $stream->rewind();
                 }
-                if ('' !== $raw && strlen($raw) <= 1_048_576) {
-                    $decoded = json_decode($raw, true);
-                    if (is_array($decoded) && array_key_exists($field, $decoded)) {
-                        $value = $decoded[$field];
+                throw new HttpException(413, 'Request payload exceeds maximum inspectable size.');
+            }
+            if ($seekable) {
+                $stream->rewind();
+            } else {
+                $request = $request->withBody(Stream::fromString($raw));
+            }
 
-                        return is_string($value) ? '' !== trim($value) : null !== $value && false !== $value;
-                    }
+            if ('' !== $raw) {
+                $decoded = json_decode($raw, true);
+                if (is_array($decoded) && array_key_exists($field, $decoded)) {
+                    $value = $decoded[$field];
+
+                    return [is_string($value) ? '' !== trim($value) : null !== $value && false !== $value, $request];
                 }
             }
         }
 
-        return false;
+        return [false, $request];
     }
 
     private function incrementProbes(string $clientId): int

@@ -238,9 +238,13 @@ final readonly class PasskeyVerifier
 
     private function verifyEd25519(string $signedPayload, string $signature, string $publicKeyHexOrRaw): bool
     {
-        $rawKey = SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES === strlen($publicKeyHexOrRaw)
-            ? $publicKeyHexOrRaw
-            : hex2bin($publicKeyHexOrRaw);
+        if (SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES === strlen($publicKeyHexOrRaw)) {
+            $rawKey = $publicKeyHexOrRaw;
+        } elseif (64 === strlen($publicKeyHexOrRaw) && ctype_xdigit($publicKeyHexOrRaw)) {
+            $rawKey = hex2bin($publicKeyHexOrRaw);
+        } else {
+            $rawKey = false;
+        }
         if (!is_string($rawKey) || SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES !== strlen($rawKey)) {
             throw new SecurityException('Invalid Ed25519 public key (expected 32 raw bytes or 64 hex chars).');
         }

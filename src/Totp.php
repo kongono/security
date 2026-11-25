@@ -149,9 +149,11 @@ final readonly class Totp
     /** Build an `otpauth://totp/...` provisioning URI for authenticator QR code scanning. */
     public function provisioningUri(#[SensitiveParameter] string $base32Secret, string $account, string $issuer): string
     {
+        $normalizedSecret = strtoupper(rtrim(str_replace([' ', '-'], '', trim($base32Secret)), '='));
+        self::base32Decode($normalizedSecret);
         $label = rawurlencode($issuer) . ':' . rawurlencode($account);
         $query = http_build_query([
-            'secret' => strtoupper(trim($base32Secret)),
+            'secret' => $normalizedSecret,
             'issuer' => $issuer,
             'algorithm' => strtoupper($this->algorithm),
             'digits' => $this->digits,
@@ -221,6 +223,9 @@ final readonly class Totp
         $bitLen = strlen($bits);
         for ($i = 0; $i + 8 <= $bitLen; $i += 8) {
             $out .= chr(((int) bindec(substr($bits, $i, 8))) & 0xFF);
+        }
+        if (strlen($out) < 10) {
+            throw new SecurityException('TOTP Base32 secret must decode to at least 10 bytes (80 bits).');
         }
 
         return $out;

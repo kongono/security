@@ -25,13 +25,14 @@ final readonly class WebhookDispatcher
      */
     public function send(string $url, string $event, array $payload, ?int $timestamp = null): array
     {
+        $ts = $timestamp ?? time();
         $body = json_encode([
             'event' => $event,
-            'timestamp' => gmdate(DATE_ATOM, $timestamp ?? time()),
+            'timestamp' => gmdate(DATE_ATOM, $ts),
             'data' => $payload,
         ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
 
-        $signature = $this->signer->sign($body, $timestamp);
+        $signature = $this->signer->sign($body, $ts);
         $response = $this->http->request('POST', $url, [
             'Content-Type' => 'application/json',
             'X-Kongono-Event' => $event,

@@ -27,13 +27,23 @@ final readonly class SecurityHeadersMiddleware implements MiddlewareInterface
             $response = $handler->handle($request);
         } catch (HttpException $e) {
             $mergedHeaders = $this->defaultHeadersFor($request);
+            $lowerMap = [];
+            foreach (array_keys($mergedHeaders) as $k) {
+                $lowerMap[strtolower($k)] = $k;
+            }
             foreach ($e->headers as $name => $value) {
+                $lower = strtolower($name);
+                if (isset($lowerMap[$lower])) {
+                    unset($mergedHeaders[$lowerMap[$lower]]);
+                }
                 $mergedHeaders[$name] = $value;
+                $lowerMap[$lower] = $name;
             }
             throw new HttpException(
                 statusCode: $e->statusCode,
                 message: $e->getMessage(),
                 headers: $mergedHeaders,
+                diagnostic: $e->diagnostic,
                 previous: $e,
             );
         }

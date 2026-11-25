@@ -38,7 +38,7 @@ final readonly class SessionAuthMiddleware implements MiddlewareInterface
         private SessionAuth $auth = new SessionAuth(),
         private ?RememberMeManager $rememberMe = null,
     ) {
-        if (null !== $loginRedirectUrl && (!str_starts_with($loginRedirectUrl, '/') || str_starts_with($loginRedirectUrl, '//') || false !== strpbrk($loginRedirectUrl, "\r\n\0"))) {
+        if (null !== $loginRedirectUrl && (!str_starts_with($loginRedirectUrl, '/') || str_starts_with($loginRedirectUrl, '//') || 1 === preg_match('/[\x00-\x1f\x7f\\\\]/', $loginRedirectUrl))) {
             throw new SecurityException('SessionAuthMiddleware loginRedirectUrl must be a safe same-origin relative path starting with "/".');
         }
     }
@@ -92,10 +92,40 @@ final readonly class SessionAuthMiddleware implements MiddlewareInterface
                 return $this->attachCookie(Response::redirect($this->loginRedirectUrl, 302), $rotatedCookie);
             }
 
-            throw new HttpException(401, 'Authentication required.');
+            $headers = [];
+            if (null !== $rotatedCookie) {
+                $headers['Set-Cookie'] = $rotatedCookie->toHeaderValue();
+                $headers['Cache-Control'] = 'private, no-cache="Set-Cookie"';
+            }
+
+            throw new HttpException(401, 'Authentication required.', $headers);
         }
 
-        $response = $handler->handle($request);
+        try {
+            $response = $handler->handle($request);
+        } catch (HttpException $e) {
+            if (null !== $rotatedCookie) {
+                $headers = $e->headers;
+                $headers['Set-Cookie'] = $rotatedCookie->toHeaderValue();
+                $existingCcKey = null;
+                foreach (array_keys($headers) as $k) {
+                    if ('cache-control' === strtolower($k)) {
+                        $existingCcKey = $k;
+                        break;
+                    }
+                }
+                $ccVal = null !== $existingCcKey ? strtolower($headers[$existingCcKey]) : '';
+                if ('' === $ccVal || (!str_contains($ccVal, 'private') && !str_contains($ccVal, 'no-store'))) {
+                    if (null !== $existingCcKey) {
+                        unset($headers[$existingCcKey]);
+                    }
+                    $headers['Cache-Control'] = 'private, no-cache="Set-Cookie"';
+                }
+
+                throw new HttpException($e->statusCode, $e->getMessage(), $headers, $e->diagnostic, $e);
+            }
+            throw $e;
+        }
 
         return $this->attachCookie($response, $rotatedCookie);
     }

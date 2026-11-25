@@ -7,6 +7,7 @@ namespace Kongono\Security\Middleware;
 use Kongono\Core\Cache\AtomicCacheInterface;
 use Kongono\Core\Cache\CacheInterface;
 use Kongono\Http\HttpException;
+use Kongono\Http\Stream;
 use Kongono\Security\Webhook\WebhookSigner;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
@@ -55,6 +56,8 @@ final readonly class VerifyWebhookMiddleware implements MiddlewareInterface
         }
         if ($stream->isSeekable()) {
             $stream->rewind();
+        } else {
+            $request = $request->withBody(Stream::fromString($body));
         }
 
         $fingerprint = $this->signer->verifyAndFingerprint($body, $sigHeader, $this->toleranceSeconds);

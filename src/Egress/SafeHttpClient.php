@@ -7,7 +7,10 @@ namespace Kongono\Security\Egress;
 use Closure;
 use CurlHandle;
 use Fiber;
+use Kongono\Core\Capabilities\EgressGuardableInterface;
+use Kongono\Core\Capabilities\ExecutionCapabilities;
 use Kongono\Security\SecurityException;
+use WeakMap;
 
 /**
  * SSRF-hardened outbound HTTP client.
@@ -18,21 +21,89 @@ use Kongono\Security\SecurityException;
  *   3. Pinning the validated IP via CURLOPT_RESOLVE while preserving TLS SNI & hostname verification
  *   4. Disabling redirects, proxies, netrc, and enforcing response byte caps
  */
-final readonly class SafeHttpClient
+final class SafeHttpClient implements EgressGuardableInterface
 {
+    /** @var array<int, Closure(string): void> */
+    private array $rootGuards = [];
+
+    /** @var ?WeakMap<object, array<int, Closure(string): void>> */
+    private ?WeakMap $fiberGuards = null;
+
+    private int $nextGuardId = 0;
+
+    /** @var list<string> */
+    private readonly array $allowedHosts;
+
     /**
-     * @param list<string>                                $allowedHosts Optional exact hostname allowlist
+     * @param list<string>                                $allowedHosts Optional exact hostname allowlist (case-insensitive)
      * @param (Closure(string): list<string>)|null        $dnsResolver  Optional custom DNS resolver for testing
      * @param ?SafeHttpFake                               $fake         Optional in-memory fake responder (still enforces full SSRF validation)
      */
     public function __construct(
-        private array $allowedHosts = [],
-        private bool $allowPlainHttp = false,
-        private bool $allowPrivateIps = false,
-        private int $maxResponseBytes = 2_097_152,
-        private ?Closure $dnsResolver = null,
-        private ?SafeHttpFake $fake = null,
-    ) {}
+        array $allowedHosts = [],
+        private readonly bool $allowPlainHttp = false,
+        private readonly bool $allowPrivateIps = false,
+        private readonly int $maxResponseBytes = 2_097_152,
+        private readonly ?Closure $dnsResolver = null,
+        private readonly ?SafeHttpFake $fake = null,
+    ) {
+        $this->allowedHosts = array_map(static fn(string $h): string => strtolower(trim($h)), $allowedHosts);
+    }
+
+    /**
+     * Register a Fiber-scoped pre-request egress guard invoked BEFORE DNS resolution or socket connect.
+     *
+     * @param Closure(string): void $guard
+     * @return Closure(): void
+     */
+    public function guardBeforeRequest(Closure $guard): Closure
+    {
+        $id = ++$this->nextGuardId;
+        $fiber = Fiber::getCurrent();
+        if (null !== $fiber) {
+            if (null === $this->fiberGuards) {
+                /** @var WeakMap<object, array<int, Closure(string): void>> $map */
+                $map = new WeakMap();
+                $this->fiberGuards = $map;
+            }
+            $guards = $this->fiberGuards[$fiber] ?? [];
+            $guards[$id] = $guard;
+            $this->fiberGuards[$fiber] = $guards;
+
+            return function () use ($fiber, $id): void {
+                if (null === $this->fiberGuards || !isset($this->fiberGuards[$fiber])) {
+                    return;
+                }
+                $guards = $this->fiberGuards[$fiber];
+                unset($guards[$id]);
+                if ([] === $guards) {
+                    unset($this->fiberGuards[$fiber]);
+                } else {
+                    $this->fiberGuards[$fiber] = $guards;
+                }
+            };
+        }
+
+        $this->rootGuards[$id] = $guard;
+
+        return function () use ($id): void {
+            unset($this->rootGuards[$id]);
+        };
+    }
+
+    private function assertBeforeRequest(string $url): void
+    {
+        ExecutionCapabilities::current()?->assertOutboundHttpAllowed($url);
+        foreach ($this->rootGuards as $guard) {
+            $guard($url);
+        }
+        $fiber = Fiber::getCurrent();
+        if (null !== $fiber && null !== $this->fiberGuards && isset($this->fiberGuards[$fiber])) {
+            foreach ($this->fiberGuards[$fiber] as $guard) {
+                $guard($url);
+            }
+        }
+    }
 
     /**
      * Construct a test-ready SafeHttpClient backed by a {@see SafeHttpFake} responder.
@@ -85,8 +156,8 @@ final readonly class SafeHttpClient
      */
     public function admitTarget(string $url): array
     {
-        if ('' === $url || 1 === preg_match('/[\x00-\x1f\x7f\\\\]/', $url)) {
-            throw new SecurityException('Outbound URL contains forbidden control characters or backslashes.');
+        if ('' === $url || 1 === preg_match('/[\x00-\x20\x7f\\\\]/', $url)) {
+            throw new SecurityException('Outbound URL contains forbidden whitespace, control characters, or backslashes.');
         }
 
         $parts = parse_url($url);
@@ -138,6 +209,7 @@ final readonly class SafeHttpClient
      */
     public function request(string $method, string $url, array $headers = [], ?string $body = null, int $timeoutSeconds = 15): array
     {
+        $this->assertBeforeRequest($url);
         $upperMethod = $this->normalizeMethod($method);
         $target = $this->admitTarget($url);
         $headerLines = $this->formatHeaders($headers);
@@ -162,16 +234,16 @@ final readonly class SafeHttpClient
         $maxBytes = $this->maxResponseBytes;
         $allowedProtos = $this->allowPlainHttp ? 'http,https' : 'https';
 
-        curl_setopt_array($ch, [
+        $options = [
             CURLOPT_CUSTOMREQUEST => $upperMethod,
             CURLOPT_HTTPHEADER => $headerLines,
-            CURLOPT_RESOLVE => [sprintf('%s:%d:%s', $target['host'], $target['port'], $pinIp)],
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_PROTOCOLS_STR => $allowedProtos,
             CURLOPT_REDIR_PROTOCOLS_STR => $allowedProtos,
             CURLOPT_PROXY => '',
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_2,
             CURLOPT_CONNECTTIMEOUT => min(10, max(1, $timeoutSeconds)),
             CURLOPT_TIMEOUT => max(1, $timeoutSeconds),
             CURLOPT_WRITEFUNCTION => static function (mixed $_ch, string $chunk) use (&$collected, &$overflow, $maxBytes): int {
@@ -184,7 +256,14 @@ final readonly class SafeHttpClient
 
                 return strlen($chunk);
             },
-        ]);
+        ];
+        if (false === filter_var(trim($target['host'], '[]'), FILTER_VALIDATE_IP)) {
+            $options[CURLOPT_RESOLVE] = [sprintf('%s:%d:%s', $target['host'], $target['port'], $pinIp)];
+        }
+        if ('HEAD' === $upperMethod) {
+            $options[CURLOPT_NOBODY] = true;
+        }
+        curl_setopt_array($ch, $options);
 
         if (null !== $body) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
@@ -223,6 +302,7 @@ final readonly class SafeHttpClient
         /** @var array<TKey, array{method: non-empty-string, headers: array<string, string>, body: ?string, timeout: int, target: array{scheme: string, host: string, port: int, ip: string, url: string}}> $prepared */
         $prepared = [];
         foreach ($requests as $key => $req) {
+            $this->assertBeforeRequest($req['url']);
             $upperMethod = $this->normalizeMethod($req['method'] ?? 'GET');
             $prepared[$key] = [
                 'method' => $upperMethod,
@@ -271,16 +351,16 @@ final readonly class SafeHttpClient
                 $overflows[$key] = false;
                 $allowedProtos = $this->allowPlainHttp ? 'http,https' : 'https';
 
-                curl_setopt_array($ch, [
+                $options = [
                     CURLOPT_CUSTOMREQUEST => $item['method'],
                     CURLOPT_HTTPHEADER => $headerLines,
-                    CURLOPT_RESOLVE => [sprintf('%s:%d:%s', $item['target']['host'], $item['target']['port'], $pinIp)],
                     CURLOPT_FOLLOWLOCATION => false,
                     CURLOPT_PROTOCOLS_STR => $allowedProtos,
                     CURLOPT_REDIR_PROTOCOLS_STR => $allowedProtos,
                     CURLOPT_PROXY => '',
                     CURLOPT_SSL_VERIFYPEER => true,
                     CURLOPT_SSL_VERIFYHOST => 2,
+                    CURLOPT_SSLVERSION => CURL_SSLVERSION_TLSv1_2,
                     CURLOPT_CONNECTTIMEOUT => min(10, max(1, $item['timeout'])),
                     CURLOPT_TIMEOUT => max(1, $item['timeout']),
                     CURLOPT_WRITEFUNCTION => static function (mixed $_ch, string $chunk) use (&$buffers, &$overflows, $key, $maxBytes): int {
@@ -293,7 +373,14 @@ final readonly class SafeHttpClient
 
                         return strlen($chunk);
                     },
-                ]);
+                ];
+                if (false === filter_var(trim($item['target']['host'], '[]'), FILTER_VALIDATE_IP)) {
+                    $options[CURLOPT_RESOLVE] = [sprintf('%s:%d:%s', $item['target']['host'], $item['target']['port'], $pinIp)];
+                }
+                if ('HEAD' === $item['method']) {
+                    $options[CURLOPT_NOBODY] = true;
+                }
+                curl_setopt_array($ch, $options);
 
                 if (null !== $item['body']) {
                     curl_setopt($ch, CURLOPT_POSTFIELDS, $item['body']);
@@ -303,14 +390,34 @@ final readonly class SafeHttpClient
                 curl_multi_add_handle($multi, $ch);
             }
 
+            /** @var array<int, int> $handleErrorCodes */
+            $handleErrorCodes = [];
             do {
                 $status = curl_multi_exec($multi, $active);
+                while (false !== ($info = curl_multi_info_read($multi))) {
+                    if (CURLMSG_DONE === ($info['msg'] ?? null) && ($info['handle'] ?? null) instanceof CurlHandle) {
+                        $handleErrorCodes[spl_object_id($info['handle'])] = is_int($info['result'] ?? null) ? $info['result'] : CURLE_OK;
+                    }
+                }
                 if (null !== Fiber::getCurrent()) {
-                    Fiber::suspend();
+                    if ($active > 0 && CURLM_OK === $status) {
+                        if (-1 === curl_multi_select($multi, 0.005)) {
+                            usleep(1000);
+                        }
+                        Fiber::suspend();
+                    }
                 } elseif ($active > 0 && CURLM_OK === $status) {
-                    curl_multi_select($multi, 0.05);
+                    if (-1 === curl_multi_select($multi, 0.05)) {
+                        usleep(1000);
+                    }
                 }
             } while ($active > 0 && (CURLM_OK === $status || CURLM_CALL_MULTI_PERFORM === $status));
+
+            while (false !== ($info = curl_multi_info_read($multi))) {
+                if (CURLMSG_DONE === ($info['msg'] ?? null) && ($info['handle'] ?? null) instanceof CurlHandle) {
+                    $handleErrorCodes[spl_object_id($info['handle'])] = is_int($info['result'] ?? null) ? $info['result'] : CURLE_OK;
+                }
+            }
 
             /** @var array<TKey, array{status: int, body: string}> $results */
             $results = [];
@@ -319,8 +426,9 @@ final readonly class SafeHttpClient
                     throw new SecurityException(sprintf('Outbound response exceeded maximum bound of %d bytes.', $this->maxResponseBytes));
                 }
                 $error = curl_error($ch);
-                if ('' !== $error) {
-                    throw new SecurityException('Outbound HTTP transfer failed: ' . $error);
+                $code = $handleErrorCodes[spl_object_id($ch)] ?? curl_errno($ch);
+                if ('' !== $error || CURLE_OK !== $code) {
+                    throw new SecurityException('Outbound HTTP transfer failed: ' . ('' !== $error ? $error : curl_strerror($code)));
                 }
                 $results[$key] = [
                     'status' => curl_getinfo($ch, CURLINFO_RESPONSE_CODE),
@@ -518,17 +626,18 @@ final readonly class SafeHttpClient
     }
 
     /**
-     * @param array<string, string> $headers
+     * @param array<array-key, string> $headers
      * @return list<string>
      */
     private function formatHeaders(array $headers): array
     {
         $lines = [];
         foreach ($headers as $name => $value) {
-            if (1 !== preg_match('/\A[a-zA-Z0-9!#$%&\'*+.^_`|~-]+\z/', $name) || false !== strpbrk($value, "\r\n\0")) {
-                throw new SecurityException(sprintf('Unsafe outbound HTTP header "%s" rejected.', $name));
+            $headerName = (string) $name;
+            if (1 !== preg_match('/\A[a-zA-Z0-9!#$%&\'*+.^_`|~-]+\z/', $headerName) || 1 === preg_match('/[\x00-\x08\x0a-\x1f\x7f]/', $value)) {
+                throw new SecurityException(sprintf('Unsafe outbound HTTP header "%s" rejected.', $headerName));
             }
-            $lines[] = $name . ': ' . $value;
+            $lines[] = $headerName . ': ' . $value;
         }
 
         return $lines;

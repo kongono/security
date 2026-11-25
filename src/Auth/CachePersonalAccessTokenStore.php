@@ -52,12 +52,13 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         );
 
         $storeTtl = null !== $ttlSeconds ? max(1, $ttlSeconds) : $this->defaultTtlSeconds;
+        $this->cache->delete($this->revokedKey($id));
         $this->cache->set($this->tokenKey($id), $record->toArray(), $storeTtl);
 
         $ids = $this->readIndex($principal->id);
         if (!in_array($id, $ids, true)) {
             $ids[] = $id;
-            $this->writeIndex($principal->id, $ids);
+            $this->writeIndex($principal->id, $ids, max($this->defaultTtlSeconds, $storeTtl));
         }
 
         return new IssuedToken('kgn_pat_' . $id . '.' . $secret, $record);
@@ -75,6 +76,12 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
             return null;
         }
 
+        // Check principal-wide revocation watermark (immune to concurrent index races)
+        $revokedBefore = $this->cache->get($this->revokedBeforeKey($record->principalId));
+        if (is_int($revokedBefore) && $record->createdAt <= $revokedBefore) {
+            return null;
+        }
+
         if (!hash_equals($record->tokenHash, hash('sha256', $parsed['secret']))) {
             return null;
         }
@@ -87,8 +94,11 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         }
 
         $updated = $record->withLastUsedAt($ts);
-        $remaining = null !== $updated->expiresAt ? max(1, $updated->expiresAt - $ts) : $this->defaultTtlSeconds;
-        $this->cache->set($this->tokenKey($updated->id), $updated->toArray(), $remaining);
+        // Only persist lastUsedAt if token has NOT been concurrently revoked (tombstone check prevents resurrection TOCTOU)
+        if (null === $this->cache->get($this->revokedKey($updated->id))) {
+            $remaining = null !== $updated->expiresAt ? max(1, $updated->expiresAt - $ts) : $this->defaultTtlSeconds;
+            $this->cache->set($this->tokenKey($updated->id), $updated->toArray(), $remaining);
+        }
 
         return $updated;
     }
@@ -98,9 +108,10 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         $ids = $this->readIndex($principalId);
         $out = [];
         $aliveIds = [];
+        $revokedBefore = $this->cache->get($this->revokedBeforeKey($principalId));
         foreach ($ids as $id) {
             $record = $this->findById($id);
-            if (null !== $record && $record->principalId === $principalId) {
+            if (null !== $record && $record->principalId === $principalId && !(is_int($revokedBefore) && $record->createdAt <= $revokedBefore)) {
                 $out[] = $record;
                 $aliveIds[] = $id;
             }
@@ -119,6 +130,8 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
             return false;
         }
 
+        $tombstoneTtl = (null !== $record->expiresAt ? max(300, $record->expiresAt - time()) : max(300, $this->defaultTtlSeconds)) + 3600;
+        $this->cache->set($this->revokedKey($tokenId), 1, $tombstoneTtl);
         $this->cache->delete($this->tokenKey($tokenId));
         $ids = array_values(array_filter(
             $this->readIndex($record->principalId),
@@ -131,10 +144,14 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
 
     public function revokeAllForPrincipal(string $principalId): int
     {
+        $this->cache->set($this->revokedBeforeKey($principalId), time(), $this->defaultTtlSeconds + 3600);
         $ids = $this->readIndex($principalId);
         $removed = 0;
         foreach ($ids as $id) {
-            if (null !== $this->findById($id)) {
+            $record = $this->findById($id);
+            if (null !== $record) {
+                $tombstoneTtl = (null !== $record->expiresAt ? max(300, $record->expiresAt - time()) : max(300, $this->defaultTtlSeconds)) + 3600;
+                $this->cache->set($this->revokedKey($id), 1, $tombstoneTtl);
                 $this->cache->delete($this->tokenKey($id));
                 ++$removed;
             }
@@ -151,6 +168,9 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
 
     private function findById(string $id): ?PersonalAccessToken
     {
+        if (null !== $this->cache->get($this->revokedKey($id))) {
+            return null;
+        }
         $raw = $this->cache->get($this->tokenKey($id));
         if (!is_array($raw)) {
             return null;
@@ -183,19 +203,29 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
     }
 
     /** @param list<string> $ids */
-    private function writeIndex(string $principalId, array $ids): void
+    private function writeIndex(string $principalId, array $ids, ?int $ttlSeconds = null): void
     {
         if ([] === $ids) {
             $this->cache->delete($this->indexKey($principalId));
 
             return;
         }
-        $this->cache->set($this->indexKey($principalId), $ids, $this->defaultTtlSeconds);
+        $this->cache->set($this->indexKey($principalId), $ids, max($this->defaultTtlSeconds, $ttlSeconds ?? $this->defaultTtlSeconds));
     }
 
     private function tokenKey(string $id): string
     {
         return $this->prefix . 'tok:' . $id;
+    }
+
+    private function revokedKey(string $id): string
+    {
+        return $this->prefix . 'rev:' . $id;
+    }
+
+    private function revokedBeforeKey(string $principalId): string
+    {
+        return $this->prefix . 'revbefore:' . hash('sha256', $principalId);
     }
 
     private function indexKey(string $principalId): string

@@ -27,13 +27,22 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
         private string $sessionCookieName = 'kongono_session',
         private string $headerName = 'X-CSRF-Token',
         private string $formField = '_csrf',
-        private array $exemptPrefixes = ['/api/'],
+        private array $exemptPrefixes = [],
+        private bool $requirePersistedSession = false,
     ) {}
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
         $method = strtoupper($request->getMethod());
         if (in_array($method, self::SAFE_METHODS, true)) {
+            return $handler->handle($request);
+        }
+
+        $cookies = $request->getCookieParams();
+        $hasSessionCookie = array_key_exists($this->sessionCookieName, $cookies);
+        $authHeader = trim($request->getHeaderLine('Authorization'));
+        // Stateless Bearer-authenticated API requests that do not send a session cookie are immune to ambient-cookie CSRF
+        if (!$hasSessionCookie && str_starts_with(strtolower($authHeader), 'bearer ') && strlen($authHeader) > 7) {
             return $handler->handle($request);
         }
 
@@ -48,7 +57,13 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
         ) {
             $normalizedPath = (string) preg_replace('#/+#', '/', '/' . ltrim($rawPath, '/'));
             foreach ($this->exemptPrefixes as $prefix) {
-                if ('' !== $prefix && str_starts_with($normalizedPath, $prefix)) {
+                if ('' === $prefix) {
+                    continue;
+                }
+                $matches = str_ends_with($prefix, '/')
+                    ? str_starts_with($normalizedPath, $prefix)
+                    : ($normalizedPath === $prefix || str_starts_with($normalizedPath, $prefix . '/'));
+                if ($matches) {
                     return $handler->handle($request);
                 }
             }
@@ -61,9 +76,12 @@ final readonly class CsrfMiddleware implements MiddlewareInterface
             }
             $sessionId = $session->id();
         } else {
-            $cookies = $request->getCookieParams();
-            $sessionId = is_string($cookies[$this->sessionCookieName] ?? null) ? $cookies[$this->sessionCookieName] : '';
-            if ('' === $sessionId) {
+            if ($this->requirePersistedSession) {
+                throw new HttpException(403, 'CSRF verification failed: verified session middleware context is required.');
+            }
+            $rawCookie = $cookies[$this->sessionCookieName] ?? null;
+            $sessionId = is_string($rawCookie) ? $rawCookie : '';
+            if ('' === $sessionId || strlen($sessionId) > 128 || 1 === preg_match('/[\x00-\x20\x7f]/', $sessionId)) {
                 throw new HttpException(403, 'CSRF verification failed: missing session context.');
             }
         }

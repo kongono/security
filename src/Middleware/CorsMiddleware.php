@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Kongono\Security\Middleware;
 
+use Kongono\Http\HttpException;
 use Kongono\Http\Response;
 use Kongono\Security\SecurityException;
 use Psr\Http\Message\ResponseInterface;
@@ -56,9 +57,30 @@ final readonly class CorsMiddleware implements MiddlewareInterface
                 ->withHeader('Access-Control-Max-Age', (string) $this->maxAgeSeconds);
         }
 
-        $response = $handler->handle($request);
+        try {
+            $response = $handler->handle($request);
+        } catch (HttpException $e) {
+            if (null !== $admittedOrigin || $shouldVaryOrigin) {
+                $headers = $e->headers;
+                if (null !== $admittedOrigin) {
+                    $headers['Access-Control-Allow-Origin'] = $admittedOrigin;
+                    if ($this->allowCredentials && '*' !== $admittedOrigin) {
+                        $headers['Access-Control-Allow-Credentials'] = 'true';
+                    }
+                }
+                if (!self::headerArrayHasVaryOrigin($headers)) {
+                    $headers['Vary'] = isset($headers['Vary']) && '' !== trim($headers['Vary'])
+                        ? $headers['Vary'] . ', Origin'
+                        : 'Origin';
+                }
+
+                throw new HttpException($e->statusCode, $e->getMessage(), $headers, $e->diagnostic, $e);
+            }
+            throw $e;
+        }
+
         if (null === $admittedOrigin) {
-            return $shouldVaryOrigin && !str_contains(strtolower($response->getHeaderLine('Vary')), 'origin')
+            return $shouldVaryOrigin && !self::responseHasVaryOrigin($response)
                 ? $response->withAddedHeader('Vary', 'Origin')
                 : $response;
         }
@@ -83,14 +105,47 @@ final readonly class CorsMiddleware implements MiddlewareInterface
 
     private function applyCorsHeaders(ResponseInterface $response, string $admittedOrigin): ResponseInterface
     {
-        $response = $response
-            ->withHeader('Access-Control-Allow-Origin', $admittedOrigin)
-            ->withAddedHeader('Vary', 'Origin');
+        $response = $response->withHeader('Access-Control-Allow-Origin', $admittedOrigin);
+        if (!self::responseHasVaryOrigin($response)) {
+            $response = $response->withAddedHeader('Vary', 'Origin');
+        }
 
         if ($this->allowCredentials && '*' !== $admittedOrigin) {
             $response = $response->withHeader('Access-Control-Allow-Credentials', 'true');
         }
 
         return $response;
+    }
+
+    private static function responseHasVaryOrigin(ResponseInterface $response): bool
+    {
+        foreach ($response->getHeader('Vary') as $line) {
+            foreach (explode(',', $line) as $token) {
+                $t = strtolower(trim($token));
+                if ('origin' === $t || '*' === $t) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /** @param array<string, string> $headers */
+    private static function headerArrayHasVaryOrigin(array $headers): bool
+    {
+        foreach ($headers as $k => $v) {
+            if ('vary' !== strtolower($k)) {
+                continue;
+            }
+            foreach (explode(',', $v) as $token) {
+                $t = strtolower(trim($token));
+                if ('origin' === $t || '*' === $t) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 }

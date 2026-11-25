@@ -40,6 +40,9 @@ final readonly class PkceOAuthClient
         if ('' === trim($tokenUrl) || !str_starts_with(strtolower($tokenUrl), 'https://') || 1 === preg_match('/[\x00-\x1f\x7f]/', $tokenUrl)) {
             throw new SecurityException('OAuth tokenUrl must be a valid https:// URL.');
         }
+        if (null !== $userInfoUrl && ('' === trim($userInfoUrl) || !str_starts_with(strtolower($userInfoUrl), 'https://') || 1 === preg_match('/[\x00-\x1f\x7f]/', $userInfoUrl))) {
+            throw new SecurityException('OAuth userInfoUrl must be a valid https:// URL.');
+        }
     }
 
     /**
@@ -140,14 +143,17 @@ final readonly class PkceOAuthClient
             throw new SecurityException('OAuth authorization code and PKCE code_verifier are required.');
         }
 
-        $form = http_build_query([
+        $params = [
             'grant_type' => 'authorization_code',
             'client_id' => $this->clientId,
-            'client_secret' => $this->clientSecret,
             'code' => $code,
             'redirect_uri' => $redirectUri,
             'code_verifier' => $codeVerifier,
-        ], '', '&', PHP_QUERY_RFC3986);
+        ];
+        if ('' !== $this->clientSecret) {
+            $params['client_secret'] = $this->clientSecret;
+        }
+        $form = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
 
         $res = $this->send('POST', $this->tokenUrl, [
             'Accept' => 'application/json',

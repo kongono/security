@@ -26,9 +26,10 @@ final readonly class RememberMeManager
     public function __construct(
         private CacheInterface $cache,
         private string $cookieName = 'kongono_remember',
-        private bool $secure = false,
+        private bool $secure = true,
         private string $sameSite = 'Lax',
         private string $prefix = 'kongono:remember:',
+        private int $maxAbsoluteLifetimeSeconds = 7_776_000,
     ) {}
 
     public function cookieName(): string
@@ -39,9 +40,13 @@ final readonly class RememberMeManager
     /** Issue a fresh persistent remember-me cookie for `$principal`. */
     public function issue(Principal $principal, int $ttlSeconds = 2_592_000, ?int $now = null): Cookie
     {
+        $ts = $now ?? time();
         $series = bin2hex(random_bytes(16));
+        $maxCap = max(60, $this->maxAbsoluteLifetimeSeconds);
+        $effectiveTtl = min(max(60, $ttlSeconds), $maxCap);
+        $absoluteExpiresAt = $ts + $maxCap;
 
-        return $this->issueInSeries($principal, $series, max(60, $ttlSeconds), $now ?? time());
+        return $this->issueInSeries($principal, $series, $effectiveTtl, $ts, $absoluteExpiresAt);
     }
 
     /**
@@ -80,11 +85,13 @@ final readonly class RememberMeManager
         $series = is_string($raw['series'] ?? null) ? $raw['series'] : '';
         $validatorHash = is_string($raw['validator_hash'] ?? null) ? $raw['validator_hash'] : '';
         $expiresAt = is_int($raw['expires_at'] ?? null) ? $raw['expires_at'] : 0;
+        $absoluteExpiresAt = is_int($raw['absolute_expires_at'] ?? null) ? $raw['absolute_expires_at'] : $expiresAt;
         $ttl = is_int($raw['ttl'] ?? null) ? $raw['ttl'] : 2_592_000;
+        $ownerId = is_array($raw['principal'] ?? null) && is_string($raw['principal']['id'] ?? null) ? $raw['principal']['id'] : null;
 
-        if ('' === $series || '' === $validatorHash || $ts >= $expiresAt) {
+        if ('' === $series || '' === $validatorHash || $ts >= $expiresAt || $ts >= $absoluteExpiresAt) {
             if ('' !== $series) {
-                $this->revokeSeries($series);
+                $this->revokeSeries($series, $ownerId);
             }
 
             return null;
@@ -92,23 +99,24 @@ final readonly class RememberMeManager
 
         if (!hash_equals($validatorHash, hash('sha256', $parsed['validator']))) {
             // Wrong validator for a real selector indicates cookie tampering / guessing -> revoke series
-            $this->revokeSeries($series);
+            $this->revokeSeries($series, $ownerId);
 
             return null;
         }
 
         $principal = self::hydratePrincipal($raw['principal'] ?? null);
         if (null === $principal) {
-            $this->revokeSeries($series);
+            $this->revokeSeries($series, $ownerId);
 
             return null;
         }
 
-        // Remember the consumed selector so any future replay by a thief revokes the newly rotated token
-        $remaining = max(60, $expiresAt - $ts);
+        $nextTtl = min($ttl, max(1, $absoluteExpiresAt - $ts));
+        // Remember the consumed selector for at least the rotated cookie's lifetime so late replays revoke the series
+        $remaining = max(60, min($expiresAt, $absoluteExpiresAt) - $ts, $nextTtl);
         $this->cache->set($this->usedKey($parsed['selector']), $series, $remaining);
 
-        $rotatedCookie = $this->issueInSeries($principal, $series, $ttl, $ts);
+        $rotatedCookie = $this->issueInSeries($principal, $series, $nextTtl, $ts, $absoluteExpiresAt);
 
         return [
             'principal' => $principal,
@@ -126,10 +134,45 @@ final readonly class RememberMeManager
 
         $selectorKey = $this->selectorKey($parsed['selector']);
         $raw = $this->cache->get($selectorKey);
-        $this->cache->delete($selectorKey);
-        if (is_array($raw) && is_string($raw['series'] ?? null)) {
-            $this->revokeSeries($raw['series']);
+        if (is_array($raw)) {
+            $validatorHash = is_string($raw['validator_hash'] ?? null) ? $raw['validator_hash'] : '';
+            if ('' === $validatorHash || !hash_equals($validatorHash, hash('sha256', $parsed['validator']))) {
+                return;
+            }
+            $this->cache->delete($selectorKey);
+            $ownerId = is_array($raw['principal'] ?? null) && is_string($raw['principal']['id'] ?? null) ? $raw['principal']['id'] : null;
+            if (is_string($raw['series'] ?? null)) {
+                $this->revokeSeries($raw['series'], $ownerId);
+            }
+
+            return;
         }
+
+        $usedSeries = $this->cache->get($this->usedKey($parsed['selector']));
+        if (is_string($usedSeries) && '' !== $usedSeries) {
+            $this->revokeSeries($usedSeries);
+            $this->cache->delete($this->usedKey($parsed['selector']));
+        }
+    }
+
+    /** Revoke every active remember-me series for a principal (e.g. on password reset or logout-all). */
+    public function revokeAllForPrincipal(string $principalId): int
+    {
+        $raw = $this->cache->get($this->principalSeriesKey($principalId));
+        $this->cache->delete($this->principalSeriesKey($principalId));
+        if (!is_array($raw)) {
+            return 0;
+        }
+
+        $revoked = 0;
+        foreach ($raw as $series) {
+            if (is_string($series) && '' !== $series) {
+                $this->revokeSeries($series);
+                ++$revoked;
+            }
+        }
+
+        return $revoked;
     }
 
     /** Build an expired cookie header to clear the remember-me cookie from the browser. */
@@ -146,7 +189,7 @@ final readonly class RememberMeManager
         );
     }
 
-    private function issueInSeries(Principal $principal, string $series, int $ttlSeconds, int $now): Cookie
+    private function issueInSeries(Principal $principal, string $series, int $ttlSeconds, int $now, int $absoluteExpiresAt): Cookie
     {
         $selector = bin2hex(random_bytes(12));
         $validator = bin2hex(random_bytes(32));
@@ -155,6 +198,7 @@ final readonly class RememberMeManager
             'series' => $series,
             'validator_hash' => hash('sha256', $validator),
             'expires_at' => $now + $ttlSeconds,
+            'absolute_expires_at' => $absoluteExpiresAt,
             'ttl' => $ttlSeconds,
             'principal' => [
                 'id' => $principal->id,
@@ -165,6 +209,22 @@ final readonly class RememberMeManager
         ], $ttlSeconds + 5);
 
         $this->cache->set($this->seriesKey($series), $selector, $ttlSeconds + 5);
+
+        $pKey = $this->principalSeriesKey($principal->id);
+        $existing = $this->cache->get($pKey);
+        /** @var list<string> $seriesList */
+        $seriesList = [];
+        if (is_array($existing)) {
+            foreach ($existing as $item) {
+                if (is_string($item) && '' !== $item) {
+                    $seriesList[] = $item;
+                }
+            }
+        }
+        if (!in_array($series, $seriesList, true)) {
+            $seriesList[] = $series;
+            $this->cache->set($pKey, $seriesList, max($ttlSeconds, $this->maxAbsoluteLifetimeSeconds) + 60);
+        }
 
         return new Cookie(
             name: $this->cookieName,
@@ -177,13 +237,35 @@ final readonly class RememberMeManager
         );
     }
 
-    private function revokeSeries(string $series): void
+    private function revokeSeries(string $series, ?string $principalId = null): void
     {
         $activeSelector = $this->cache->get($this->seriesKey($series));
         if (is_string($activeSelector) && '' !== $activeSelector) {
+            if (null === $principalId) {
+                $selRaw = $this->cache->get($this->selectorKey($activeSelector));
+                if (is_array($selRaw) && is_array($selRaw['principal'] ?? null) && is_string($selRaw['principal']['id'] ?? null)) {
+                    $principalId = $selRaw['principal']['id'];
+                }
+            }
             $this->cache->delete($this->selectorKey($activeSelector));
         }
         $this->cache->delete($this->seriesKey($series));
+
+        if (null !== $principalId && '' !== $principalId) {
+            $pKey = $this->principalSeriesKey($principalId);
+            $existing = $this->cache->get($pKey);
+            if (is_array($existing)) {
+                $filtered = array_values(array_filter(
+                    $existing,
+                    static fn(mixed $item): bool => is_string($item) && '' !== $item && $item !== $series,
+                ));
+                if ([] === $filtered) {
+                    $this->cache->delete($pKey);
+                } elseif (count($filtered) !== count($existing)) {
+                    $this->cache->set($pKey, $filtered, max(60, $this->maxAbsoluteLifetimeSeconds) + 60);
+                }
+            }
+        }
     }
 
     private function getAndDelete(string $key): mixed
@@ -218,8 +300,13 @@ final readonly class RememberMeManager
             return null;
         }
 
-        $kindVal = is_string($raw['kind'] ?? null) ? $raw['kind'] : PrincipalKind::Human->value;
-        $kind = PrincipalKind::tryFrom($kindVal) ?? PrincipalKind::Human;
+        if (!is_string($raw['kind'] ?? null)) {
+            return null;
+        }
+        $kind = PrincipalKind::tryFrom($raw['kind']);
+        if (null === $kind) {
+            return null;
+        }
 
         /** @var list<string> $capabilities */
         $capabilities = [];
@@ -255,5 +342,10 @@ final readonly class RememberMeManager
     private function usedKey(string $selector): string
     {
         return $this->prefix . 'used:' . $selector;
+    }
+
+    private function principalSeriesKey(string $principalId): string
+    {
+        return $this->prefix . 'pseries:' . hash('sha256', $principalId);
     }
 }

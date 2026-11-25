@@ -43,7 +43,7 @@ final readonly class PasswordHasher
         if ('' === $plainPassword || '' === $hash || strlen($plainPassword) > self::MAX_PASSWORD_BYTES) {
             return false;
         }
-        if ((str_starts_with($hash, '$2y$') || str_starts_with($hash, '$2a$') || str_starts_with($hash, '$2b$'))
+        if ((str_starts_with($hash, '$2y$') || str_starts_with($hash, '$2a$') || str_starts_with($hash, '$2b$') || str_starts_with($hash, '$2x$'))
             && (strlen($plainPassword) > 72 || str_contains($plainPassword, "\0"))
         ) {
             return false;

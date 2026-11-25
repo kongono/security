@@ -140,7 +140,9 @@ final class Gate
             return null;
         }
 
-        return (bool) $callable($principal, $resource);
+        $decision = $callable($principal, $resource);
+
+        return true === $decision;
     }
 
     private static function abilityToMethodName(string $capability): string

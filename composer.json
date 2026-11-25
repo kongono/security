@@ -6,7 +6,11 @@
   "require": {
     "php": ">=8.5.0",
     "ext-curl": "*",
+    "ext-openssl": "*",
     "ext-sodium": "*",
+    "kongono/core": "^1.0",
+    "kongono/database": "^1.0",
+    "kongono/http": "^1.0",
     "psr/http-message": "^2.0",
     "psr/http-server-handler": "^1.0",
     "psr/http-server-middleware": "^1.0"

@@ -24,7 +24,7 @@ final readonly class RequireAuthenticatedMiddleware implements MiddlewareInterfa
     public function __construct(
         private ?string $redirectTo = null,
     ) {
-        if (null !== $redirectTo && (!str_starts_with($redirectTo, '/') || str_starts_with($redirectTo, '//') || false !== strpbrk($redirectTo, "\r\n\0"))) {
+        if (null !== $redirectTo && (!str_starts_with($redirectTo, '/') || str_starts_with($redirectTo, '//') || 1 === preg_match('/[\x00-\x1f\x7f\\\\]/', $redirectTo))) {
             throw new SecurityException('RequireAuthenticatedMiddleware redirectTo must be a safe same-origin relative path starting with "/".');
         }
     }
