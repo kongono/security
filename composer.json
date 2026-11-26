@@ -1,23 +1,60 @@
 {
   "name": "kongono/security",
-  "description": "Kongono v1 Principals (Human/Service/Agent), capability Gate, Argon2id hashing, AEAD XChaCha20-Poly1305 Encryptor, HMAC TokenSigner & SignedUrl, CSRF/CORS/Bearer/SecurityHeaders middleware, and SSRF-hardened SafeHttpClient.",
+  "description": "Kongono v1 standalone PHP 8.5 security & passwordless auth primitives: HKDF XChaCha20-Poly1305 Encryptor, Argon2id PasswordHasher, RFC 6238 Totp + pure-PHP ISO/IEC 18004 QrCodeSvg, cryptographic QrLoginAuth, OneTimeCodeAuth (Email/SMS OTP), MagicLinkAuth, WebAuthn PasskeyVerifier (ES256/Ed25519), PKCE OAuth, PersonalAccessToken, HTML5 Lexbor HtmlSanitizer, WebhookSigner, and SSRF-pinned SafeHttpClient.",
   "type": "library",
   "license": "MIT",
+  "keywords": [
+    "php85",
+    "kongono",
+    "security",
+    "auth",
+    "passkeys",
+    "webauthn",
+    "totp",
+    "2fa",
+    "qr-login",
+    "magic-link",
+    "otp",
+    "ssrf",
+    "encryption"
+  ],
+  "homepage": "https://kongono.com",
+  "authors": [
+    {
+      "name": "Anthony Iovanna",
+      "email": "ant@kongono.com"
+    }
+  ],
+  "support": {
+    "issues": "https://github.com/kongono/framework/issues",
+    "source": "https://github.com/kongono/framework",
+    "docs": "https://kongono.com/docs"
+  },
   "require": {
-    "php": ">=8.5.0",
+    "php": ">=8.5.13",
     "ext-curl": "*",
+    "ext-dom": "*",
+    "ext-json": "*",
+    "ext-mbstring": "*",
     "ext-openssl": "*",
     "ext-sodium": "*",
-    "kongono/core": "^1.0",
-    "kongono/database": "^1.0",
-    "kongono/http": "^1.0",
+    "kongono/core": "^1.21",
     "psr/http-message": "^2.0",
     "psr/http-server-handler": "^1.0",
     "psr/http-server-middleware": "^1.0"
+  },
+  "suggest": {
+    "kongono/database": "Required only when using PdoPersonalAccessTokenStore for SQL-backed Personal Access Tokens.",
+    "kongono/http": "Required only when using SessionAuth, RememberMeManager, Gate HTTP exceptions, or Kongono PSR-15 security middleware."
   },
   "autoload": {
     "psr-4": {
       "Kongono\\Security\\": "src/"
     }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "config": {
+    "sort-packages": true
   }
 }
