@@ -6,6 +6,7 @@ namespace Kongono\Security;
 
 use Kongono\Core\Cache\AtomicCacheInterface;
 use Kongono\Core\Cache\CacheInterface;
+use Kongono\Security\Auth\QrCodeSvg;
 use SensitiveParameter;
 
 /**
@@ -186,6 +187,25 @@ final readonly class Totp
         ], '', '&', PHP_QUERY_RFC3986);
 
         return sprintf('otpauth://totp/%s?%s', $label, $query);
+    }
+
+    /**
+     * Render a strict-CSP inline `<svg>` QR code for scanning with Google Authenticator,
+     * 1Password, Apple Passwords, or Authy (zero external libraries or CDN calls).
+     */
+    public function provisioningQrSvg(
+        #[SensitiveParameter]
+        string $base32Secret,
+        string $account,
+        string $issuer,
+        int $size = 220,
+    ): string {
+        return QrCodeSvg::render(
+            payload: $this->provisioningUri($base32Secret, $account, $issuer),
+            size: $size,
+            ecLevel: 'M',
+            ariaLabel: sprintf('2FA authenticator QR code for %s', $issuer),
+        );
     }
 
     private function hotp(#[SensitiveParameter] string $base32Secret, int $counter): string
