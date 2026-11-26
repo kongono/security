@@ -42,7 +42,12 @@ final readonly class CapabilityMiddleware implements MiddlewareInterface
             if ($active->readOnlyDb || null !== $active->maxQueries) {
                 /** @var list<object> $guardedConnections */
                 $guardedConnections = [];
-                foreach (['Kongono\\Database\\ConnectionInterface', QueryGuardableInterface::class] as $id) {
+                foreach ([
+                    'Kongono\\Database\\ConnectionInterface',
+                    'Kongono\\Database\\PdoConnection',
+                    'Kongono\\Database\\ReadWriteConnection',
+                    QueryGuardableInterface::class,
+                ] as $id) {
                     if (!$this->container->hasBinding($id)) {
                         continue;
                     }

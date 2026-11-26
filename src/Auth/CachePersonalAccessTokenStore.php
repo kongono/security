@@ -53,18 +53,21 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         );
 
         $storeTtl = null !== $ttlSeconds ? max(1, $ttlSeconds) : $this->defaultTtlSeconds;
-        $revGen = $this->currentRevocationGen($principal->id);
-        $this->cache->delete($this->revokedKey($id));
-        $payload = $record->toArray();
-        $payload['_rev_gen'] = $revGen;
-        $this->cache->set($this->tokenKey($id), $payload, $storeTtl);
-
         $maxTtlKey = $this->maxTtlKey($principal->id);
         $prevMaxTtl = $this->cache->get($maxTtlKey);
         $effectiveMaxTtl = max($this->defaultTtlSeconds, $storeTtl, is_int($prevMaxTtl) ? $prevMaxTtl : 0);
+        $metaTtl = $effectiveMaxTtl + 86400;
         if (!is_int($prevMaxTtl) || $effectiveMaxTtl > $prevMaxTtl) {
-            $this->cache->set($maxTtlKey, $effectiveMaxTtl, $effectiveMaxTtl + 3600);
+            $this->cache->set($maxTtlKey, $effectiveMaxTtl, $metaTtl);
         }
+
+        // Always persist a non-zero generation anchor outliving every active token so cache expiry/eviction fails closed
+        $revGen = $this->ensureRevocationGen($principal->id, $metaTtl);
+        $this->cache->delete($this->revokedKey($id));
+        $payload = $record->toArray();
+        $payload['_rev_gen'] = $revGen;
+        $payload['_store_expires_at'] = $ts + $storeTtl;
+        $this->cache->set($this->tokenKey($id), $payload, $storeTtl);
 
         $ids = $this->readIndex($principal->id);
         if (!in_array($id, $ids, true)) {
@@ -88,9 +91,11 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         }
         $record = $found['record'];
         $tokenGen = $found['rev_gen'];
+        $storeExpiresAt = $found['store_expires_at'];
 
-        // Check principal-wide revocation generation counter (handles same-second revokeAll + re-issue and concurrent index races)
-        if ($tokenGen < $this->currentRevocationGen($record->principalId)) {
+        // Fail closed if principal revocation generation metadata expired/evicted OR token predates a revokeAll
+        $storedGen = $this->storedRevocationGen($record->principalId);
+        if (null === $storedGen || $tokenGen < $storedGen) {
             return null;
         }
 
@@ -99,21 +104,25 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         }
 
         $ts = $now ?? time();
-        if ($record->isExpired($ts)) {
+        if ($record->isExpired($ts) || (null !== $storeExpiresAt && $ts >= $storeExpiresAt)) {
             $this->revoke($record->id);
 
             return null;
         }
 
         $updated = $record->withLastUsedAt($ts);
-        // Only persist lastUsedAt if token has NOT been concurrently revoked (tombstone + generation check prevents resurrection TOCTOU)
+        // Only persist lastUsedAt if token has NOT been concurrently revoked, and NEVER extend past original storage deadline
+        $currentGen = $this->storedRevocationGen($updated->principalId);
         if (
             null === $this->cache->get($this->revokedKey($updated->id))
-            && $tokenGen >= $this->currentRevocationGen($updated->principalId)
+            && null !== $currentGen
+            && $tokenGen >= $currentGen
         ) {
-            $remaining = null !== $updated->expiresAt ? max(1, $updated->expiresAt - $ts) : $this->defaultTtlSeconds;
+            $deadline = $updated->expiresAt ?? $storeExpiresAt ?? ($updated->createdAt + $this->defaultTtlSeconds);
+            $remaining = max(1, $deadline - $ts);
             $payload = $updated->toArray();
             $payload['_rev_gen'] = $tokenGen;
+            $payload['_store_expires_at'] = $deadline;
             $this->cache->set($this->tokenKey($updated->id), $payload, $remaining);
         }
 
@@ -125,7 +134,10 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         $ids = $this->readIndex($principalId);
         $out = [];
         $aliveIds = [];
-        $currentGen = $this->currentRevocationGen($principalId);
+        $currentGen = $this->storedRevocationGen($principalId);
+        if (null === $currentGen) {
+            return [];
+        }
         foreach ($ids as $id) {
             $found = $this->findEntryById($id);
             if (null !== $found && $found['record']->principalId === $principalId && $found['rev_gen'] >= $currentGen) {
@@ -162,12 +174,13 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
     public function revokeAllForPrincipal(string $principalId): int
     {
         $observedMax = $this->cache->get($this->maxTtlKey($principalId));
-        $genTtl = max($this->defaultTtlSeconds, is_int($observedMax) ? $observedMax : 0) + 3600;
+        $genTtl = max($this->defaultTtlSeconds, is_int($observedMax) ? $observedMax : 0) + 86400;
         $genKey = $this->revGenKey($principalId);
         if ($this->cache instanceof AtomicCacheInterface) {
-            $this->cache->increment($genKey, 1, $genTtl);
+            $newGen = $this->cache->increment($genKey, 1, $genTtl);
+            $this->cache->set($genKey, max(2, $newGen), $genTtl);
         } else {
-            $this->cache->set($genKey, $this->currentRevocationGen($principalId) + 1, $genTtl);
+            $this->cache->set($genKey, max(1, $this->storedRevocationGen($principalId) ?? 1) + 1, $genTtl);
         }
 
         $ids = $this->readIndex($principalId);
@@ -196,7 +209,7 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         return $this->findEntryById($id)['record'] ?? null;
     }
 
-    /** @return array{record: PersonalAccessToken, rev_gen: int}|null */
+    /** @return array{record: PersonalAccessToken, rev_gen: int, store_expires_at: ?int}|null */
     private function findEntryById(string $id): ?array
     {
         if (null !== $this->cache->get($this->revokedKey($id))) {
@@ -221,6 +234,7 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         return [
             'record' => $record,
             'rev_gen' => is_int($normalized['_rev_gen'] ?? null) ? $normalized['_rev_gen'] : 0,
+            'store_expires_at' => is_int($normalized['_store_expires_at'] ?? null) ? $normalized['_store_expires_at'] : null,
         ];
     }
 
@@ -272,11 +286,38 @@ final readonly class CachePersonalAccessTokenStore implements PersonalAccessToke
         return $this->prefix . 'maxttl:' . hash('sha256', $principalId);
     }
 
-    private function currentRevocationGen(string $principalId): int
+    private function storedRevocationGen(string $principalId): ?int
     {
         $raw = $this->cache->get($this->revGenKey($principalId));
 
-        return is_int($raw) ? $raw : 0;
+        return is_int($raw) && $raw >= 1 ? $raw : null;
+    }
+
+    private function ensureRevocationGen(string $principalId, int $ttlSeconds): int
+    {
+        $genKey = $this->revGenKey($principalId);
+        $existing = $this->storedRevocationGen($principalId);
+        if (null !== $existing) {
+            $this->cache->set($genKey, $existing, $ttlSeconds);
+
+            return $existing;
+        }
+
+        if ($this->cache instanceof AtomicCacheInterface) {
+            if ($this->cache->add($genKey, 1, $ttlSeconds)) {
+                return 1;
+            }
+            $concurrent = $this->storedRevocationGen($principalId);
+            if (null !== $concurrent) {
+                $this->cache->set($genKey, $concurrent, $ttlSeconds);
+
+                return $concurrent;
+            }
+        }
+
+        $this->cache->set($genKey, 1, $ttlSeconds);
+
+        return 1;
     }
 
     private function indexKey(string $principalId): string

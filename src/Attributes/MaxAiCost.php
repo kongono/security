@@ -15,7 +15,7 @@ use Psr\Http\Server\MiddlewareInterface;
  * Least-privilege route capability sandbox: enforces a strict per-request AI spend ceiling in USD
  * exposed via `$request->getAttribute(ExecutionCapabilities::class)->recordAiSpend(...)`.
  */
-#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD)]
+#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::TARGET_FUNCTION)]
 final readonly class MaxAiCost implements MiddlewareAttributeInterface
 {
     public function __construct(

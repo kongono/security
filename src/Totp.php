@@ -20,13 +20,15 @@ final readonly class Totp
     private string $algorithm;
 
     /**
-     * @param int $digits Number of digits (6-8, standard: 6)
-     * @param int $period Time step in seconds (standard: 30)
+     * @param int                        $digits      Number of digits (6-8, standard: 6)
+     * @param int                        $period      Time step in seconds (standard: 30)
+     * @param ?AtomicCacheInterface      $replayCache Optional default atomic replay cache applied automatically on every verify() call
      */
     public function __construct(
         private int $digits = 6,
         private int $period = 30,
         string $algorithm = 'sha1',
+        private ?AtomicCacheInterface $replayCache = null,
     ) {
         if ($digits < 6 || $digits > 8) {
             throw new SecurityException('TOTP digits must be between 6 and 8.');
@@ -91,6 +93,22 @@ final readonly class Totp
     }
 
     /**
+     * Strictly single-use RFC 6238 verification requiring an `AtomicCacheInterface` replay store.
+     * Returns the matched time-step counter on first valid use, or `null` on mismatch or replay.
+     */
+    public function verifyOnce(
+        #[SensitiveParameter]
+        string $base32Secret,
+        string $userCode,
+        AtomicCacheInterface $replayCache,
+        int $window = 1,
+        ?int $timestamp = null,
+        ?int $lastVerifiedStep = null,
+    ): ?int {
+        return $this->verifyAndReturnTimeStep($base32Secret, $userCode, $window, $timestamp, $lastVerifiedStep, $replayCache);
+    }
+
+    /**
      * Verify a TOTP code and return the matched time-step counter (or null on failure/replay)
      * so callers can persist `lastVerifiedStep` and reject duplicate use per RFC 6238 Section 5.2.
      */
@@ -128,25 +146,26 @@ final readonly class Totp
             return null;
         }
 
-        if (null !== $replayCache) {
-            if (!$replayCache instanceof AtomicCacheInterface) {
+        $effectiveReplayCache = $replayCache ?? $this->replayCache;
+        if (null !== $effectiveReplayCache) {
+            if (!$effectiveReplayCache instanceof AtomicCacheInterface) {
                 throw new SecurityException('TOTP replay protection requires an AtomicCacheInterface implementation to prevent concurrent code reuse.');
             }
             $secretScope = hash('sha256', $key . ':' . $this->algorithm . ':' . $this->digits . ':' . $this->period);
             $lastStepKey = 'kongono:totp:last:' . $secretScope;
-            $cachedLast = $replayCache->get($lastStepKey);
+            $cachedLast = $effectiveReplayCache->get($lastStepKey);
             if (is_int($cachedLast) && $matchedStep <= $cachedLast) {
                 return null;
             }
 
             $replayKey = 'kongono:totp:used:' . hash('sha256', $secretScope . ':' . $matchedStep);
             $ttl = (2 * $drift + 2) * $this->period;
-            if (!$replayCache->add($replayKey, true, $ttl)) {
+            if (!$effectiveReplayCache->add($replayKey, true, $ttl)) {
                 return null;
             }
 
             $nextLast = is_int($cachedLast) ? max($cachedLast, $matchedStep) : $matchedStep;
-            $replayCache->set($lastStepKey, $nextLast, $ttl);
+            $effectiveReplayCache->set($lastStepKey, $nextLast, $ttl);
         }
 
         return $matchedStep;

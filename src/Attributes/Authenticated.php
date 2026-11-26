@@ -17,7 +17,7 @@ use Psr\Http\Server\MiddlewareInterface;
  *   `#[Authenticated]`
  *   `#[Authenticated(redirectTo: '/login')]`
  */
-#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD)]
+#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::TARGET_FUNCTION)]
 final readonly class Authenticated implements MiddlewareAttributeInterface
 {
     public function __construct(

@@ -14,7 +14,7 @@ use Kongono\Security\Webhook\WebhookSigner;
 use Psr\Http\Server\MiddlewareInterface;
 
 /** Declarative inbound webhook HMAC verification attribute with fail-closed replay protection. */
-#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD)]
+#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::TARGET_FUNCTION)]
 final readonly class VerifyWebhook implements MiddlewareAttributeInterface
 {
     private const string FALLBACK_REPLAY_CACHE_ID = 'kongono.webhook.replay_cache';

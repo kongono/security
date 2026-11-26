@@ -15,7 +15,7 @@ use Psr\Http\Server\MiddlewareInterface;
  * Least-privilege route capability sandbox: hard-blocks all outbound HTTP calls via `SafeHttpClient`
  * BEFORE DNS resolution or socket creation, eliminating SSRF / data exfiltration on this endpoint.
  */
-#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD)]
+#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::TARGET_FUNCTION)]
 final readonly class NoOutboundHttp implements MiddlewareAttributeInterface
 {
     public function toMiddleware(Container $container): MiddlewareInterface

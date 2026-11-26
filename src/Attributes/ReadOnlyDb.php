@@ -15,7 +15,7 @@ use Psr\Http\Server\MiddlewareInterface;
  * Least-privilege route capability sandbox: hard-blocks all mutating/DDL SQL (`INSERT`, `UPDATE`,
  * `DELETE`, `DROP`, `ALTER`, CTE writes, etc.) at the database driver BEFORE execution.
  */
-#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD)]
+#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::TARGET_FUNCTION)]
 final readonly class ReadOnlyDb implements MiddlewareAttributeInterface
 {
     public function toMiddleware(Container $container): MiddlewareInterface

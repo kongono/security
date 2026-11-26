@@ -16,7 +16,7 @@ use Psr\Http\Server\MiddlewareInterface;
  *
  * Example: `#[Can('notes.write')]`
  */
-#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::IS_REPEATABLE)]
+#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::TARGET_FUNCTION | Attribute::IS_REPEATABLE)]
 final readonly class Can implements MiddlewareAttributeInterface
 {
     public function __construct(

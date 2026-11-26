@@ -15,7 +15,7 @@ use Psr\Http\Server\MiddlewareInterface;
  * Least-privilege route capability sandbox: enforces a strict maximum SQL query count per request,
  * catching runaway N+1 query loops live before they overload the database.
  */
-#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD)]
+#[Attribute(Attribute::TARGET_CLASS | Attribute::TARGET_METHOD | Attribute::TARGET_FUNCTION)]
 final readonly class MaxQueries implements MiddlewareAttributeInterface
 {
     public function __construct(
