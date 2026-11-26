@@ -38,7 +38,7 @@
     "ext-mbstring": "*",
     "ext-openssl": "*",
     "ext-sodium": "*",
-    "kongono/core": "^1.22",
+    "kongono/core": "^1.23",
     "psr/http-message": "^2.0",
     "psr/http-server-handler": "^1.0",
     "psr/http-server-middleware": "^1.0"
