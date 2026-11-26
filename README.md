@@ -5,7 +5,7 @@
 Standalone, zero-Symfony PHP 8.5.13+ security & passwordless authentication primitives usable in **any** PHP application (Laravel, Symfony, Slim, or vanilla PHP):
 
 - **Cryptographic QR Login & Pure-PHP SVG QR Encoder:** `QrLoginAuth` (phishing-resistant cross-device sign-in with desktop-only `poll_secret`, 6-digit `XXX-XXX` QRLjacking verification code & atomic single-use `claim()`) + `QrCodeSvg` (ISO/IEC 18004 Versions 1–10 strict-CSP inline `<svg>`).
-- **Passwordless & 2FA:** `OneTimeCodeAuth` (Email/SMS OTP with HKDF storage & brute-force lockout), `MagicLinkAuth` (single-use HMAC links), `PasskeyVerifier` (WebAuthn/FIDO2 ES256 & Ed25519), `Totp` (RFC 6238 + `provisioningQrSvg()` + 80-bit recovery codes), `PkceOAuthClient` (GitHub/Google/OIDC S256).
+- **Passwordless, Passkeys & 2FA:** `PasskeyVerifier` (complete WebAuthn/FIDO2 registration & assertions with pure-PHP RFC 8949 `CborDecoder` for ES256 P-256, EdDSA Ed25519 & RS256 Windows Hello TPMs), `OneTimeCodeAuth` (Email/SMS OTP with HKDF storage & brute-force lockout), `MagicLinkAuth` (single-use HMAC links), `Totp` (RFC 6238 + `provisioningQrSvg()` + 80-bit recovery codes), `PkceOAuthClient` (GitHub/Google/OIDC S256).
 - **Cryptography & App Defense:** HKDF `Encryptor` v2 (XChaCha20-Poly1305 AEAD + key rotation), Argon2id `PasswordHasher`, `TokenSigner`, `SignedUrl`, revocable SHA-256 `PersonalAccessToken`, HTML5 Lexbor `HtmlSanitizer`, `WebhookSigner`/`WebhookDispatcher`, and DNS-pinned SSRF-proof `SafeHttpClient`.
 
 ## Installation
